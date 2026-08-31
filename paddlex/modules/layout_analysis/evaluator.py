@@ -14,6 +14,7 @@
 
 
 from ..object_detection import DetEvaluator
+from .dataset_spec import get_dataset_spec
 from .model_list import MODELS
 
 
@@ -26,7 +27,16 @@ class LayoutAnalysisEvaluator(DetEvaluator):
         """update evaluation config"""
         if self.eval_config.log_interval:
             self.pdx_config.update_log_interval(self.eval_config.log_interval)
+        # Keep the metric declared in the model config. `DetConfig.update_dataset`
+        # defaults `metric` to "COCO" and writes it unconditionally, so omitting
+        # it here would silently downgrade e.g. DocLayoutV3Metric to plain COCO
+        # and drop reading-order evaluation.
+        metric = self.pdx_config.metric if "metric" in self.pdx_config else "COCO"
+        dataset_type, data_fields = get_dataset_spec(self.global_config.model)
         self.pdx_config.update_dataset(
-            self.global_config.dataset_dir, "COCOInstSegDataset"
+            self.global_config.dataset_dir,
+            dataset_type,
+            data_fields=data_fields,
+            metric=metric,
         )
         self.pdx_config.update_weights(self.eval_config.weight_path)

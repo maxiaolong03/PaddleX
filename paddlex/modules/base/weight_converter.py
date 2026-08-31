@@ -38,6 +38,7 @@ from .utils.pdparams2safetensors import (
     PP_CHART2TABLE_MAPPING,
     PP_DOCLAYOUTV2_DROP_PREFIXES,
     PP_DOCLAYOUTV2_MAPPING,
+    PP_DOCLAYOUTV4_MAPPING,
     PP_FORMULANET_MAPPING,
     PPLCNET_MAPPING,
     PPOCRV5_MOBILE_DET_MAPPING,
@@ -80,6 +81,68 @@ def build_weight_converter(config: AttrDict) -> "WeightConverter":
     return WeightConverter(config)
 
 
+def _derive_doclayoutv4_s2r_config(config, numpy_sd):
+    """Reconcile PP-DocLayoutV4's S2R config fields with the actual checkpoint.
+
+    ``PPDocLayoutV4S2RFusion`` only stores ``a``; when ``s2r_learnable_b`` is
+    false the reference implementation keeps ``b`` as a plain Python float, so
+    its value has to travel in the config instead of the weights. That makes the
+    S2R block the one place where a wrong config silently produces wrong numbers
+    -- every weight still loads. The defaults in ``MODEL_CONFIGS`` match the one
+    published training recipe, but PaddleDetection's own class defaults differ
+    (``s2r_a_init=4.0``, ``s2r_learnable_b=True``), so a checkpoint from any
+    other recipe would be mis-described.
+
+    Whatever the weights can prove is taken from them; ``s2r_steps`` and
+    ``s2r_damping`` leave no trace in the checkpoint at all, so those are only
+    warned about. Drop a ``config.json`` next to the input ``.pdparams`` to
+    override the whole file.
+    """
+    config = dict(config)
+    has_a = "model.s2r_fusion.a" in numpy_sd
+    has_b = "model.s2r_fusion.b" in numpy_sd
+
+    if not has_a and not has_b:
+        if config.get("use_s2r"):
+            logging.warning(
+                "No s2r_fusion weights found in the checkpoint; writing "
+                "use_s2r: false. Reading order will use the relative-order "
+                "head alone."
+            )
+        config["use_s2r"] = False
+        return config
+
+    config["use_s2r"] = True
+    # `s2r_a_init` is deliberately left alone: `a` is a real parameter that the
+    # checkpoint overwrites, so the initializer has no effect on inference (the
+    # published config says 0.0 while the trained value is ~24). `b` is the
+    # opposite -- when it is not learnable there is no parameter to load.
+    config["s2r_learnable_b"] = has_b
+    if has_b:
+        config["s2r_b_init"] = float(numpy_sd["model.s2r_fusion.b"].reshape(-1)[0])
+        logging.info(
+            "Checkpoint carries s2r_fusion.b; writing s2r_learnable_b: true "
+            "with s2r_b_init %s.",
+            config["s2r_b_init"],
+        )
+    else:
+        logging.warning(
+            "Checkpoint has no s2r_fusion.b (s2r_learnable_b: false), so the "
+            "fused weight b cannot be recovered from the weights. Writing the "
+            "default s2r_b_init: %s -- if your training config used a "
+            "different value, supply your own config.json.",
+            config.get("s2r_b_init"),
+        )
+    logging.warning(
+        "s2r_steps (%s) and s2r_damping (%s) are not recoverable from a "
+        "checkpoint; the published defaults are being written. Override them "
+        "with your own config.json if your training config differed.",
+        config.get("s2r_steps"),
+        config.get("s2r_damping"),
+    )
+    return config
+
+
 # Model registry: model_name -> (key_mapping, drop_key_prefixes)
 _MODEL_REGISTRY = {
     "PP-LCNet_x1_0_doc_ori": (PPLCNET_MAPPING, []),
@@ -108,6 +171,7 @@ _MODEL_REGISTRY = {
     "SLANeXt_wireless": (SLANEXT_MAPPING, SLANEXT_DROP_PREFIXES),
     "PP-DocLayoutV2": (PP_DOCLAYOUTV2_MAPPING, PP_DOCLAYOUTV2_DROP_PREFIXES),
     "PP-DocLayoutV3": (RTDETR_MAPPING, []),
+    "PP-DocLayoutV4": (PP_DOCLAYOUTV4_MAPPING, []),
     "RT-DETR-L_wired_table_cell_det": (RTDETR_MAPPING, []),
     "RT-DETR-L_wireless_table_cell_det": (RTDETR_MAPPING, []),
     "PP-DocLayout_plus-L": (RTDETR_MAPPING, []),
@@ -194,6 +258,12 @@ _TRANSPOSE_SUBSTRINGS = [
     "query_pos_head",
     "dec_global_pointer",
     "dec_order_head",
+    # PP-DocLayoutV4 ROOR head: `dec_order_head` / `dec_global_pointer` are not
+    # substrings of these, so they need their own entries. The ROOR order head
+    # weight is square ([256, 256]), so a missing transpose here would corrupt
+    # the weights silently instead of failing to load.
+    "dec_roor_global_pointer",
+    "dec_roor_order_head",
     "attention_weights",
     "sampling_offsets",
     "value_proj",
@@ -404,7 +474,7 @@ class WeightConverter:
 
         os.makedirs(self.output_dir, exist_ok=True)
         self._save_safetensors(numpy_sd)
-        self._save_model_config()
+        self._save_model_config(numpy_sd)
         self._save_preprocessor_config()
         self._save_inference_yml()
 
@@ -518,12 +588,14 @@ class WeightConverter:
         save_file(numpy_sd, out_path)
         logging.info(f"Saved model.safetensors to: {out_path}")
 
-    def _save_model_config(self):
+    def _save_model_config(self, numpy_sd=None):
         """Save config.json — user-provided or official default."""
-        data = self._user_configs.get(
-            "config.json",
-            MODEL_CONFIGS.get(self.model_name, {}),
-        )
+        if "config.json" in self._user_configs:
+            data = self._user_configs["config.json"]
+        else:
+            data = dict(MODEL_CONFIGS.get(self.model_name, {}))
+            if self.model_name == "PP-DocLayoutV4" and numpy_sd is not None:
+                data = _derive_doclayoutv4_s2r_config(data, numpy_sd)
         out_path = os.path.join(self.output_dir, "config.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)

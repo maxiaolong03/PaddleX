@@ -20,6 +20,7 @@ import numpy as np
 STATIC_SHAPE_MODEL_LIST = [
     "PP-DocLayoutV2",
     "PP-DocLayoutV3",
+    "PP-DocLayoutV4",
 ]
 
 
@@ -277,7 +278,13 @@ def _get_order_single_image(roor_b, rel_b):
     components = _find_connected_components(N, dag_edges)
 
     # Step 4: Compute node votes from relative scores
-    rel_scores = 1.0 / (1.0 + np.exp(-rel_b))  # sigmoid
+    # Numerically stable sigmoid: the raw logits reach +-1e4 (masked entries),
+    # which overflows `exp(-x)` for the naive form.
+    rel_scores = np.where(
+        rel_b >= 0,
+        1.0 / (1.0 + np.exp(-np.abs(rel_b))),
+        np.exp(-np.abs(rel_b)) / (1.0 + np.exp(-np.abs(rel_b))),
+    )
     np.fill_diagonal(rel_scores, 0.0)
     node_votes = np.sum(rel_scores, axis=0)  # [N]
 

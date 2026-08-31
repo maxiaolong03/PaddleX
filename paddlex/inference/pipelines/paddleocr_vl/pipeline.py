@@ -18,6 +18,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from itertools import chain
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -38,8 +39,6 @@ from ..layout_parsing.title_level import assign_levels_to_parsing_res
 from ..layout_parsing.utils import construct_img_path, gather_imgs
 from .result import BaseResult, PaddleOCRVLBlock, PaddleOCRVLResult
 
-from .mineru_utils import block_content_to_html
-
 from .uilts import (
     convert_otsl_to_html,
     crop_margin,
@@ -54,6 +53,28 @@ from .uilts import (
 )
 
 IMAGE_LABELS = ["image", "header_image", "footer_image"]
+
+
+@lru_cache(maxsize=1)
+def _load_mineru_block_content_to_html():
+    """Resolve MinerU2.5's table converter lazily.
+    ``mineru_utils`` is an optional module: it is not always present in the
+    tree, and importing it at module scope breaks ``import paddlex`` outright
+    (``pipelines/__init__.py`` eagerly imports this package). Returning ``None``
+    when it is missing lets MinerU2.5 fall back to the shared OTSL converter
+    instead of taking the whole library down.
+    """
+    try:
+        from .mineru_utils import block_content_to_html
+    except ImportError:
+        logging.warning(
+            "MinerU2.5 table post-processing is unavailable: "
+            "paddlex.inference.pipelines.paddleocr_vl.mineru_utils could not be "
+            "imported. Falling back to the OTSL-to-HTML converter, which may "
+            "produce different table markup for this model."
+        )
+        return None
+    return block_content_to_html
 
 
 @benchmark.time_methods
@@ -118,10 +139,14 @@ class _PaddleOCRVLPipeline(BasePipeline):
                     {"model_config_error": "config error for layout_det_model!"},
                 )
                 model_name = layout_det_config.get("model_name", None)
-                assert model_name is not None and model_name in [
+                supported_layout_models = [
                     "PP-DocLayoutV2",
                     "PP-DocLayoutV3",
-                ], "model_name must be PP-DocLayoutV2 or PP-DocLayoutV3"
+                    "PP-DocLayoutV4",
+                ]
+                assert (
+                    model_name is not None and model_name in supported_layout_models
+                ), f"model_name must be one of {supported_layout_models}"
                 layout_kwargs = {}
                 if (threshold := layout_det_config.get("threshold", None)) is not None:
                     layout_kwargs["threshold"] = threshold
@@ -684,8 +709,13 @@ class _PaddleOCRVLPipeline(BasePipeline):
                             result_str = " $$ " + result_str + " $$ "
                     if block_label == "table":
                         html_str = ""
-                        if self.vl_rec_model.model_name == "MinerU2.5":
-                            html_str = block_content_to_html(result_str)
+                        mineru_to_html = (
+                            _load_mineru_block_content_to_html()
+                            if self.vl_rec_model.model_name == "MinerU2.5"
+                            else None
+                        )
+                        if mineru_to_html is not None:
+                            html_str = mineru_to_html(result_str)
                         elif self.vl_rec_model.model_name in [
                             "Dolphinv2",
                             "MonkeyOCR-pro-3B",

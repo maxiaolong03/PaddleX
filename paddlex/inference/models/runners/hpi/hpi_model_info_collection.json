@@ -1474,6 +1474,10 @@
         "onnxruntime",
         "paddle"
       ],
+      "PP-DocLayoutV4": [
+        "onnxruntime",
+        "paddle"
+      ],
       "fastspeech2_csmsc": [
         "paddle"
       ],
@@ -2966,6 +2970,10 @@
         "paddle"
       ],
       "PP-DocLayoutV3": [
+        "onnxruntime",
+        "paddle"
+      ],
+      "PP-DocLayoutV4": [
         "onnxruntime",
         "paddle"
       ],
@@ -4462,6 +4470,10 @@
         "paddle"
       ],
       "PP-DocLayoutV3": [
+        "onnxruntime",
+        "paddle"
+      ],
+      "PP-DocLayoutV4": [
         "onnxruntime",
         "paddle"
       ],
@@ -5898,6 +5910,10 @@
         "onnxruntime",
         "paddle"
       ],
+      "PP-DocLayoutV4": [
+        "onnxruntime",
+        "paddle"
+      ],
       "fastspeech2_csmsc": [
         "paddle"
       ],
@@ -7349,6 +7365,10 @@
         "onnxruntime",
         "paddle"
       ],
+      "PP-DocLayoutV4": [
+        "onnxruntime",
+        "paddle"
+      ],
       "fastspeech2_csmsc": [
         "paddle"
       ],
@@ -8796,6 +8816,10 @@
         "paddle"
       ],
       "PP-DocLayoutV3": [
+        "onnxruntime",
+        "paddle"
+      ],
+      "PP-DocLayoutV4": [
         "onnxruntime",
         "paddle"
       ],
@@ -9861,6 +9885,10 @@
         "onnxruntime",
         "paddle"
       ],
+      "PP-DocLayoutV4": [
+        "onnxruntime",
+        "paddle"
+      ],
       "fastspeech2_csmsc": [
         "paddle"
       ],
@@ -10936,6 +10964,10 @@
         "onnxruntime",
         "paddle"
       ],
+      "PP-DocLayoutV4": [
+        "onnxruntime",
+        "paddle"
+      ],
       "fastspeech2_csmsc": [
         "paddle"
       ],
@@ -11996,6 +12028,10 @@
         "paddle"
       ],
       "PP-DocLayoutV3": [
+        "onnxruntime",
+        "paddle"
+      ],
+      "PP-DocLayoutV4": [
         "onnxruntime",
         "paddle"
       ],

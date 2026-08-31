@@ -343,6 +343,7 @@ class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):
         models_required_imgsize = [
             "PP-DocLayoutV2",
             "PP-DocLayoutV3",
+            "PP-DocLayoutV4",
         ]
         if any(name in self.model_name for name in models_required_imgsize):
             ordered_required_keys = (

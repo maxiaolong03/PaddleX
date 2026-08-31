@@ -516,6 +516,32 @@ PP_DOCLAYOUTV2_MAPPING = RTDETR_MAPPING + [
     ),
 ]
 
+# PP-DocLayoutV4 extends RTDETR with the ROOR (direct-successor) reading-order
+# head and the S2R fusion module. RTDETR_MAPPING already covers the relative
+# order head (``dec_order_head`` / ``dec_global_pointer``), which V4 shares, so
+# only the three V4-only prefixes are added here.
+#
+# Ownership matters: the order heads, global pointers and s2r_fusion are
+# attributes of RTDETRTransformerV2 and are merely *passed into*
+# TransformerDecoderV2.forward, so their keys are ``transformer.<name>``, never
+# ``transformer.decoder.<name>``.
+#
+# Note ``s2r_fusion`` only contributes ``a`` (shape [1]). With
+# ``s2r_learnable_b: false`` the fork stores ``b`` as a plain Python float, so
+# there is no ``s2r_fusion.b`` key in the checkpoint -- the value lives in the
+# config (``s2r_b_init``) instead.
+PP_DOCLAYOUTV4_MAPPING = RTDETR_MAPPING + [
+    (
+        r"^transformer\.dec_roor_order_head\.",
+        r"model.decoder_roor_order_head.",
+    ),
+    (
+        r"^transformer\.dec_roor_global_pointer\.",
+        r"model.decoder_roor_global_pointer.",
+    ),
+    (r"^transformer\.s2r_fusion\.", r"model.s2r_fusion."),
+]
+
 
 # UVDoc
 UVDOC_MAPPING = [

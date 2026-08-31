@@ -14,6 +14,7 @@
 
 
 from ..object_detection import DetTrainer
+from .dataset_spec import get_dataset_spec
 from .model_list import MODELS
 
 
@@ -25,16 +26,10 @@ class LayoutAnalysisTrainer(DetTrainer):
     def _update_dataset(self):
         """update dataset settings"""
         metric = self.pdx_config.metric if "metric" in self.pdx_config else "COCO"
+        dataset_type, data_fields = get_dataset_spec(self.global_config.model)
         self.pdx_config.update_dataset(
             self.global_config.dataset_dir,
-            "COCOInstSegDataset",
-            data_fields=[
-                "image",
-                "gt_bbox",
-                "gt_class",
-                "gt_poly",
-                "is_crowd",
-                "gt_read_order",
-            ],
+            dataset_type,
+            data_fields=data_fields,
             metric=metric,
         )
