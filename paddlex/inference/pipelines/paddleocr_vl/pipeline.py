@@ -1523,3 +1523,7 @@ class PaddleOCRVL15Pipeline(_BasePaddleOCRVLPipeline):
 @pipeline_requires_extra("ocr")
 class PaddleOCRVL16Pipeline(_BasePaddleOCRVLPipeline):
     entities = "PaddleOCR-VL-1.6"
+
+@pipeline_requires_extra("ocr")
+class PaddleOCRVL18Pipeline(_BasePaddleOCRVLPipeline):
+    entities = "PaddleOCR-VL-1.8"

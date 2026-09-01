@@ -24,7 +24,11 @@ from .processors import LayoutAnalysisProcess
 from .result import LayoutAnalysisResult
 from .utils import STATIC_SHAPE_MODEL_LIST
 
-LAYOUT_ANALYSIS_TRANSFORMERS_MODELS = ["PP-DocLayoutV2", "PP-DocLayoutV3"]
+LAYOUT_ANALYSIS_TRANSFORMERS_MODELS = [
+    "PP-DocLayoutV2",
+    "PP-DocLayoutV3",
+    "PP-DocLayoutV4",
+]
 
 
 class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):

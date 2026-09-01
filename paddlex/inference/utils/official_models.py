@@ -72,6 +72,7 @@ ALL_MODELS = [
     "PaddleOCR-VL",
     "PaddleOCR-VL-1.5",
     "PaddleOCR-VL-1.6",
+    "PaddleOCR-VL-1.8",
     "PP-LCNet_x0_25",
     "PP-LCNet_x0_25_textline_ori",
     "PP-LCNet_x0_35",
@@ -379,6 +380,7 @@ OCR_MODELS = [
     "PaddleOCR-VL",
     "PaddleOCR-VL-1.5",
     "PaddleOCR-VL-1.6",
+    "PaddleOCR-VL-1.8",
     "PicoDet_layout_1x",
     "PicoDet_layout_1x_table",
     "PicoDet-L_layout_17cls",
@@ -485,6 +487,7 @@ SAFETENSORS_SUPPORTED_MODELS_WITHOUT_SUFFIX: Set[str] = {
     "PaddleOCR-VL-0.9B",
     "PaddleOCR-VL-1.5-0.9B",
     "PaddleOCR-VL-1.6-0.9B",
+    "PaddleOCR-VL-1.8-0.9B",
 }
 
 SAFETENSORS_SUPPORTED_MODELS: Set[str] = (
