@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import math
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -29,66 +30,86 @@ if is_dep_available("shapely"):
 
 
 @function_requires_deps("opencv-contrib-python")
-def rotate_shape_crop(
-    img: np.ndarray,
-    points,
-    page_angle: float,
-    min_angle_deg: float = 1.0,
-) -> Optional[np.ndarray]:
-    """Rigidly un-rotate one region by `page_angle` and crop it.
+def rectify_shape_crop(img, points, homography, min_size=2, max_scale=4.0):
+    """Rectify one region with the page homography and crop it.
 
-    `page_angle` follows the layout model's convention (cv2.getRotationMatrix2D:
-    positive = counter-clockwise), so it is how far the page content has been
-    rotated away from upright and the correction is a rotation by `-page_angle`.
-    A rigid rotation, not a quad-to-rectangle warp: the shape is only used to
-    decide the output extent, never to define a correspondence, so glyphs keep
-    their aspect ratio and are never sheared.
+    ``homography`` is the single page-level correction from
+    ``page_rectify.build_page_homography``.  It is applied to the region's shape;
+    the shape's bounding box in the rectified frame becomes the crop, and the
+    translation that moves it to the origin is folded into the matrix, so
+    ``warpPerspective`` only resamples that block.  Because every block shares the
+    one page matrix, its geometry equals the block cut out of a whole-page
+    rectification: an edge block gets the keystone of its true page position.
 
-    `points` may be a quad, a mask polygon, or the corners of an axis-aligned
-    box.  Image and shape go through the same matrix, so they stay aligned no
-    matter how wrong the angle is (verified: whiting out in the original frame
-    and then rotating differs from rotating and then whiting out on 0.34% of
-    pixels, all of them within 2px of the polygon edge, i.e. edge interpolation
-    only).  The shape's bounding box becomes the crop, and the matrix carries the
-    translation that puts it at the origin, so warpAffine only ever computes the
-    pixels the crop needs.
+    Equal-area scaling.  Keystone correction magnifies the far side of the page
+    and shrinks the near side, so a block cut from the rectified page would be
+    up- or down-sampled depending on where it sits -- and down-sampling throws
+    away pixels of the photo for good.  Each block is therefore scaled uniformly
+    so the rectified shape covers as many pixels as the original shape did: the
+    photo's own pixel budget for that block, redistributed by the correction but
+    neither discarded nor invented.  A uniform scale does not change the
+    rectified geometry, only the size, and every block is recognised on its own,
+    so block-to-block relative size carries no information.  ``max_scale`` stays
+    as a guard for degenerate shapes.
 
-    Everything but the orientation matches the uncorrected path: the area outside
-    the shape is whited out with the rotated polygon exactly as the plain crop
-    does with the original one.  Out-of-image area is filled white rather than
-    replicated, because a quad is not clipped to the image and BORDER_REPLICATE
-    would smear edge pixels *inside* it; white agrees with the masking below.
-
-    Returns None when the page is already upright, so those crops stay
-    unresampled.
+    Everything but the geometry matches the plain crop: area outside the
+    transformed shape is whited out, and out-of-image area is filled white (a quad
+    is not clipped to the image).  Returns ``(crop, matrix)`` -- ``matrix`` maps
+    page pixels to crop pixels, for callers that draw into the crop -- or None
+    when the region degenerates.
     """
-    if abs(page_angle) < min_angle_deg:
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 1, 2)
+    src = pts.reshape(-1, 2)
+    warped = cv2.perspectiveTransform(pts, homography).reshape(-1, 2)
+
+    area_src = abs(cv2.contourArea(src.astype(np.float32)))
+    area_dst = abs(cv2.contourArea(warped.astype(np.float32)))
+    scale = math.sqrt(area_src / area_dst) if area_src > 0 and area_dst > 0 else 1.0
+    # Compare sides sorted by length: after a quarter turn the block's width and
+    # height trade places, and an axis-by-axis ratio would report a thin block's
+    # own aspect ratio as "growth" and shrink it for nothing.
+    in_sides = np.sort(np.maximum(src.max(axis=0) - src.min(axis=0), 1.0))
+    out_sides = np.sort((warped.max(axis=0) - warped.min(axis=0)) * scale)
+    grow = float(np.max(out_sides / in_sides))
+    if grow > max_scale:
+        scale *= max_scale / grow
+
+    warped = warped * scale
+    top_left = warped.min(axis=0)
+    width, height = np.round(warped.max(axis=0) - top_left).astype(int)
+    if width < min_size or height < min_size:
         return None
 
-    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
-    center = pts.mean(axis=0)
-    matrix = cv2.getRotationMatrix2D((float(center[0]), float(center[1])),
-                                     -page_angle, 1.0)
-    rotated = pts @ matrix[:, :2].T + matrix[:, 2]
-    top_left = rotated.min(axis=0)
-    width, height = np.round(rotated.max(axis=0) - top_left).astype(int)
-    if width < 2 or height < 2:
-        return None
-    matrix[:, 2] -= top_left
+    matrix = np.array(
+        [[scale, 0.0, -float(top_left[0])],
+         [0.0, scale, -float(top_left[1])],
+         [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    ) @ homography
 
-    crop = cv2.warpAffine(
+    crop = cv2.warpPerspective(
         img,
         matrix,
         (int(width), int(height)),
-        flags=cv2.INTER_CUBIC,
+        flags=cv2.INTER_LINEAR,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=(255, 255, 255),
     )
-    polygon = np.round(rotated - top_left).astype(np.int32).reshape(-1, 1, 2)
+    polygon = cv2.perspectiveTransform(pts, matrix)
     mask = np.zeros(crop.shape[:2], dtype=np.uint8)
-    cv2.fillPoly(mask, [polygon], 1)
+    cv2.fillPoly(mask, [np.round(polygon).astype(np.int32)], 1)
     crop[~mask.astype(bool)] = 255
-    return crop
+    return crop, matrix
+
+
+def _rot90_matrix(k, w, h):
+    """Page->crop map of ``np.rot90(crop, k)`` for a ``w x h`` crop (pixel indices)."""
+    m = np.eye(3)
+    for step in range(k % 4):
+        ww = w if step % 2 == 0 else h
+        # np.rot90 with k=1 sends pixel (x, y) to (y, ww - 1 - x)
+        m = np.array([[0.0, 1.0, 0.0], [-1.0, 0.0, ww - 1.0], [0.0, 0.0, 1.0]]) @ m
+    return m
 
 
 class CropByBoxes(BaseOperator):
@@ -105,7 +126,8 @@ class CropByBoxes(BaseOperator):
         img: np.ndarray,
         boxes: List[dict],
         layout_shape_mode="auto",
-        page_angle: Optional[float] = None,
+        page_homography: Optional[np.ndarray] = None,
+        rot90_k: int = 0,
     ) -> List[dict]:
         """
         Process the input image and bounding boxes to produce a list of cropped images
@@ -117,18 +139,26 @@ class CropByBoxes(BaseOperator):
                 information including 'cls_id' (class ID), 'coordinate' (bounding box
                 coordinates as a list or tuple, left, top, right, bottom),
                 and optionally 'label' (label text).
-            use_layout_mask (bool, optional): Whether to use layout mask. Defaults to `False`.
-            page_angle (float, optional): In-plane rotation of the page in degrees,
-                as predicted by the layout model.  When given, every crop is
-                rigidly rotated back by that angle so downstream recognition sees
-                upright text; `None` (the default) keeps the plain axis-aligned
-                crop.  Only the returned image changes -- 'box' stays in original
-                page coordinates, so reading order and output geometry are
-                untouched.
+            layout_shape_mode (str, optional): Which region shape to crop by.
+            page_homography (np.ndarray, optional): A 3x3 page rectification
+                (``page_rectify.build_page_homography``) applied to every block,
+                so each crop is rectified as if cut from the rectified page.  Only
+                the returned image changes -- 'box' stays in original page
+                coordinates, so reading order and output geometry are untouched.
+                ``None`` keeps the plain axis-aligned crop.
+            rot90_k (int, optional): Rotate every plain crop by ``np.rot90(crop,
+                rot90_k)`` -- a bare quarter turn, exact, with no interpolation
+                (``page_rectify.plan_page_correction`` picks it when the page is a
+                quarter turn but the fine deformation is not worth a resampling).
+                Ignored when ``page_homography`` is given, which already contains
+                the turn.  0 leaves the crop as is.
 
         Returns:
             list[dict]: A list of dictionaries, each containing a cropped image ('img'),
                 the original bounding box coordinates ('box'), and the label ('label').
+                A corrected crop also carries 'crop_matrix', the 3x3 map from page
+                pixels to its own pixels (anything drawn into the crop by page
+                coordinates must go through it); plain crops have no such key.
         """
         output_list = []
         for box_info in boxes:
@@ -137,13 +167,17 @@ class CropByBoxes(BaseOperator):
             label = box_info.get("label", label_id)
             xmin, ymin, xmax, ymax = [int(i) for i in box]
 
-            if page_angle is not None:
-                corrected = self._correct_crop(
-                    img, box_info, layout_shape_mode, page_angle,
-                    (xmin, ymin, xmax, ymax)
+            if page_homography is not None:
+                rectified = rectify_shape_crop(
+                    img,
+                    self._region_shape(box_info, layout_shape_mode,
+                                       (xmin, ymin, xmax, ymax)),
+                    page_homography,
                 )
-                if corrected is not None:
-                    out_info = {"img": corrected, "box": box, "label": label}
+                if rectified is not None:
+                    crop, crop_matrix = rectified
+                    out_info = {"img": crop, "box": box, "label": label,
+                                "crop_matrix": crop_matrix}
                     if "quad" in box_info:
                         out_info["quad"] = box_info["quad"]
                     if "polygon_points" in box_info:
@@ -173,25 +207,29 @@ class CropByBoxes(BaseOperator):
                 out_info["img"] = img_crop
                 out_info["quad"] = box_info["quad"]
 
+            if rot90_k % 4 and page_homography is None:
+                h_c, w_c = out_info["img"].shape[:2]
+                out_info["crop_matrix"] = _rot90_matrix(rot90_k, w_c, h_c) @ np.array(
+                    [[1.0, 0.0, -xmin], [0.0, 1.0, -ymin], [0.0, 0.0, 1.0]]
+                )
+                out_info["img"] = np.ascontiguousarray(np.rot90(out_info["img"], rot90_k))
             output_list.append(out_info)
         return output_list
 
-    def _correct_crop(self, img, box_info, layout_shape_mode, page_angle, aabb):
-        """Angle-corrected crop, or None to fall back to the plain crop.
+    @staticmethod
+    def _region_shape(box_info, layout_shape_mode, aabb):
+        """The shape a rectified crop is framed and whited out by.
 
-        Mirrors the plain path's precedence -- mask polygon, then quad -- because
-        the shape decides both the crop extent and what gets whited out.  With
-        neither (rect mode, or a model that predicts no shape) the axis-aligned
-        box is rotated instead; whiting out then removes the wedges that rotating
-        a rectangle introduces, which hold neighbouring content.
+        Mirrors the plain path's precedence -- mask polygon, then quad -- falling
+        back to the axis-aligned box corners in rect mode or when the model
+        predicts no shape.
         """
         if layout_shape_mode != "rect":
             for key in ("polygon_points", "quad"):
                 if box_info.get(key) is not None:
-                    return rotate_shape_crop(img, box_info[key], page_angle)
+                    return box_info[key]
         xmin, ymin, xmax, ymax = aabb
-        corners = [[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]]
-        return rotate_shape_crop(img, corners, page_angle)
+        return [[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]]
 
 
 @class_requires_deps("opencv-contrib-python", "shapely")

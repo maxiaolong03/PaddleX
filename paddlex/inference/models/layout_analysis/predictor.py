@@ -83,8 +83,8 @@ class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):
                 - When len(pred) == 5, it is expected to be in the format [bbox_pred, bbox_num, qi, rel_logits, roor_logits],
                   compatible with DocLayoutV2 (no mask) output.
                 - When len(pred) == 6 and pred[2] is 2-D, it is the same as the
-                  5-output case plus a trailing page-rotation tensor of shape
-                  [batch, 2] holding (angle in degrees, quadrant confidence).
+                  5-output case plus a trailing `warp_params` tensor of shape
+                  [batch, 5] = (roll_deg, quadrant_conf, shear_deg, kx, ky).
                 - When len(pred) == 3, it is expected to be in the format [boxes, box_nums, masks],
                   compatible with Instance Segmentation output.
                 - Otherwise it is treated as plain detection output [bbox_pred, bbox_num].
@@ -144,15 +144,16 @@ class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):
             return results
 
         # DocLayoutV2 without mask: 5 outputs (bbox_pred, bbox_num, qi, rel_logits, roor_logits),
-        # or 6 when the model also predicts the page rotation, which arrives as a
-        # trailing [B, 2] tensor of (angle in degrees, quadrant confidence).
+        # or 6 when the model also predicts the page deformation: a trailing
+        # [B, 5] `warp_params` = (roll_deg, quadrant_conf, shear_deg, kx, ky),
+        # passed through per image untouched (see components/common/page_rectify.py).
         if len(pred) == 5 or len(pred) == 6:
             bbox_pred, bbox_num, qi, rel_logits, roor_logits = pred[:5]
-            angle = pred[5] if len(pred) == 6 else None
-            if angle is not None and (angle.ndim != 2 or angle.shape[1] != 2):
+            warp_params = pred[5] if len(pred) == 6 else None
+            if warp_params is not None and warp_params.ndim != 2:
                 raise ValueError(
-                    f"Expected the 6th output to be the page rotation with shape "
-                    f"[batch, 2], got {angle.shape}."
+                    f"Expected the 6th output to be warp_params of shape "
+                    f"[batch, C], got {warp_params.shape}."
                 )
 
             # Detect 4-point model output (10 columns: label, score, x1,y1,x2,y2,x3,y3,x4,y4)
@@ -187,9 +188,11 @@ class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):
                     result_dict["quad"] = quad_all[box_idx_start:box_idx_end]
                 else:
                     result_dict["quad"] = None
-                if angle is not None:
-                    result_dict["page_angle"] = float(angle[idx, 0])
-                    result_dict["page_angle_conf"] = float(angle[idx, 1])
+                if warp_params is not None:
+                    result_dict["warp_params"] = [
+                        float(v) for v in warp_params[idx]
+                    ]
+
                 results.append(result_dict)
                 box_idx_start = box_idx_end
             return results
@@ -319,13 +322,9 @@ class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):
         # Image-level, so it never goes through the box post-processor.  Added
         # only for models that predict it, to leave every other model's result
         # (and its serialized JSON) unchanged.  `BasePredictor.apply` splits this
-        # dict of lists by index, so each single-image result ends up with its
-        # own scalar.
-        if any("page_angle" in pred for pred in preds_list):
-            result["page_angle"] = [pred.get("page_angle") for pred in preds_list]
-            result["page_angle_conf"] = [
-                pred.get("page_angle_conf") for pred in preds_list
-            ]
+        # dict of lists by index, so each single-image result gets its own row.
+        if any("warp_params" in pred for pred in preds_list):
+            result["warp_params"] = [pred.get("warp_params") for pred in preds_list]
         return result
 
     @DetRunnerPredictor.register("Resize")

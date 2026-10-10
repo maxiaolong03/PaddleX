@@ -521,7 +521,7 @@ def paint_token(image, box, token_str):
     return image
 
 
-def tokenize_figure_of_table(table_block_img, table_box, figures):
+def tokenize_figure_of_table(table_block_img, table_box, figures, crop_matrix=None):
     """
     Replace figures in a table area with tokens, return new image and token map.
 
@@ -529,6 +529,11 @@ def tokenize_figure_of_table(table_block_img, table_box, figures):
         table_block_img (np.ndarray): Table image.
         table_box (list): Table bounding box [x_min, y_min, x_max, y_max].
         figures (List[Dict]): List of figure dicts (must contain 'coordinate', 'path').
+        crop_matrix (np.ndarray, optional): 3x3 map from page pixels to
+            `table_block_img` pixels, set when the crop was geometrically
+            corrected (rotated / rectified).  The token is then painted over the
+            figure's position in the corrected crop.  None: the crop is the plain
+            axis-aligned cut at `table_box`, as before.
 
     Returns:
         Tuple[np.ndarray, Dict[str, str], List[str]]:
@@ -575,12 +580,31 @@ def tokenize_figure_of_table(table_block_img, table_box, figures):
                 figure_x_max - table_x_min,
                 figure_y_max - table_y_min,
             ]
+            if crop_matrix is not None:
+                draw_box = _box_through(crop_matrix, figure["coordinate"],
+                                        table_block_img.shape)
+                if draw_box is None:
+                    continue
             token_str = "[F" + str(random_map[figure_id]) + "]"
             table_block_img = paint_token(table_block_img, draw_box, token_str)
             # token_map[token_str] = f'<img src="{figure["path"]}" >'
             token_map[token_str] = figure["path"]
     drop_figures = [f["path"] for i, f in enumerate(figures) if i in drop_idxes]
     return table_block_img, token_map, drop_figures
+
+
+def _box_through(matrix, box, img_shape):
+    """Axis-aligned box of `box`'s corners mapped by `matrix`, clipped to the image."""
+    x1, y1, x2, y2 = [float(v) for v in box]
+    pts = np.array([[x1, y1, 1], [x2, y1, 1], [x2, y2, 1], [x1, y2, 1]], dtype=np.float64)
+    p = pts @ np.asarray(matrix, dtype=np.float64).T
+    p = p[:, :2] / p[:, 2:3]
+    h, w = img_shape[:2]
+    bx1, by1 = np.clip(p.min(axis=0), 0, [w, h])
+    bx2, by2 = np.clip(p.max(axis=0), 0, [w, h])
+    if bx2 - bx1 < 1 or by2 - by1 < 1:
+        return None
+    return [int(round(bx1)), int(round(by1)), int(round(bx2)), int(round(by2))]
 
 
 def untokenize_figure_of_table(table_res_str, figure_token_map, image_path_to_obj_map):
