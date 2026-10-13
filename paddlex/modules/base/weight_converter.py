@@ -143,6 +143,35 @@ def _derive_doclayoutv4_s2r_config(config, numpy_sd):
     return config
 
 
+def _derive_doclayoutv4_deform_config(config, numpy_sd):
+    """Recover the optional geometric head architecture from checkpoint tensors."""
+    config = dict(config)
+    prefix = "model.deform_head.body."
+    present = any(key.startswith(prefix) for key in numpy_sd)
+    config.update(deform_pred=present, deform_out=present)
+    if present:
+        required = [
+            prefix + str(i) + suffix
+            for i in (0, 2, 4, 6)
+            for suffix in (".weight", ".bias")
+        ]
+        required.append("model.deform_bin_centers")
+        missing = [key for key in required if key not in numpy_sd]
+        if missing:
+            raise ValueError(f"Incomplete PP-DocLayoutV4 deformation head: {missing}")
+        centers = numpy_sd["model.deform_bin_centers"]
+        bins = int(centers.size)
+        if bins < 2 or numpy_sd[prefix + "6.weight"].shape[0] != 7 + 2 * bins:
+            raise ValueError("Inconsistent deformation bin count and output channels")
+        config.update(
+            deform_conv_width=int(numpy_sd[prefix + "0.weight"].shape[0]),
+            deform_kbins=bins,
+            deform_krange=float(max(abs(centers))),
+            deform_level=config.get("deform_level", 1),
+        )
+    return config
+
+
 # Model registry: model_name -> (key_mapping, drop_key_prefixes)
 _MODEL_REGISTRY = {
     "PP-LCNet_x1_0_doc_ori": (PPLCNET_MAPPING, []),
@@ -264,6 +293,10 @@ _TRANSPOSE_SUBSTRINGS = [
     # the weights silently instead of failing to load.
     "dec_roor_global_pointer",
     "dec_roor_order_head",
+    "dec_rel_head",
+    "rel_scorer",
+    "dec_succ_head",
+    "succ_scorer",
     "attention_weights",
     "sampling_offsets",
     "value_proj",
@@ -582,10 +615,17 @@ class WeightConverter:
 
     def _save_safetensors(self, numpy_sd):
         """Save numpy state dict as model.safetensors."""
+        import numpy as np
         from safetensors.numpy import save_file
 
         out_path = os.path.join(self.output_dir, "model.safetensors")
-        save_file(numpy_sd, out_path)
+        # Transposes and fused-QKV slices are views. Safetensors requires dense
+        # C-order storage; preserve scalar shapes while materializing each view.
+        contiguous_sd = {
+            key: np.asarray(value, order="C")
+            for key, value in numpy_sd.items()
+        }
+        save_file(contiguous_sd, out_path)
         logging.info(f"Saved model.safetensors to: {out_path}")
 
     def _save_model_config(self, numpy_sd=None):
@@ -596,6 +636,7 @@ class WeightConverter:
             data = dict(MODEL_CONFIGS.get(self.model_name, {}))
             if self.model_name == "PP-DocLayoutV4" and numpy_sd is not None:
                 data = _derive_doclayoutv4_s2r_config(data, numpy_sd)
+                data = _derive_doclayoutv4_deform_config(data, numpy_sd)
         out_path = os.path.join(self.output_dir, "config.json")
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)

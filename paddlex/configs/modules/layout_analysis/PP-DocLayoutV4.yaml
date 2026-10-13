@@ -19,11 +19,7 @@ Train:
   epochs_iters: 100
   batch_size: 4
   learning_rate: 0.0001
-  # No PP-DocLayoutV4_pretrained.pdparams has been published yet. Leaving this
-  # null falls back to the repo_apis config's `pretrain_weights`
-  # (PP-DocLayout_plus-L_pretrained.pdparams), which is what the reference
-  # PaddleDetection config initializes from. Point both this and
-  # `Export.weight_path` at the V4 checkpoint once it is uploaded.
+  # Required for geometry-only training: use a trained V4 checkpoint (e.g. epoch122).
   pretrain_weight_path: null
   warmup_steps: 100
   resume_path: null

@@ -21,7 +21,10 @@ from paddlex.inference.pipelines.components.common.page_rectify import (
     split_roll,
 )
 
-REF = "/paddle/LayoutModel-layoutv3_final/tools/rectify_page.py"
+REF = os.environ.get(
+    "LAYOUTMODEL_RECTIFY_REFERENCE",
+    "/paddle/LayoutModel-layoutv3_final/tools/rectify_page.py",
+)
 
 
 @pytest.fixture(scope="module")

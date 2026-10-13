@@ -23,6 +23,19 @@ class LayoutAnalysisTrainer(DetTrainer):
 
     entities = MODELS
 
+    def update_config(self):
+        super().update_config()
+        if (
+            self.global_config.model == "PP-DocLayoutV4"
+            and self.pdx_config.dict.get("deform_only_train", False)
+            and not self.pdx_config.dict.get("pretrain_weights")
+            and not self.train_config.get("resume_path")
+        ):
+            raise ValueError(
+                "Geometry-only training requires a trained V4 detector. Set "
+                "Train.pretrain_weight_path or Train.resume_path before training."
+            )
+
     def _update_dataset(self):
         """update dataset settings"""
         metric = self.pdx_config.metric if "metric" in self.pdx_config else "COCO"

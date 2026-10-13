@@ -7,6 +7,12 @@ use_queues: True
 
 use_doc_preprocessor: False
 use_layout_detection: True
+# Requires PP-DocLayoutV4 weights with the page deformation head.
+use_layout_deform: False
+layout_deform_conf_thresh: 0.9
+layout_deform_min_roll: 2.0
+layout_deform_min_shear: 2.0
+layout_deform_min_keystone: 2.0
 use_chart_recognition: False
 use_seal_recognition: False
 format_block_content: False

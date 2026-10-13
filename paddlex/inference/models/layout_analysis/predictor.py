@@ -150,10 +150,12 @@ class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):
         if len(pred) == 5 or len(pred) == 6:
             bbox_pred, bbox_num, qi, rel_logits, roor_logits = pred[:5]
             warp_params = pred[5] if len(pred) == 6 else None
-            if warp_params is not None and warp_params.ndim != 2:
+            if warp_params is not None and (
+                warp_params.ndim != 2 or warp_params.shape != (len(bbox_num), 5)
+            ):
                 raise ValueError(
                     f"Expected the 6th output to be warp_params of shape "
-                    f"[batch, C], got {warp_params.shape}."
+                    f"[batch, 5], got {warp_params.shape}."
                 )
 
             # Detect 4-point model output (10 columns: label, score, x1,y1,x2,y2,x3,y3,x4,y4)
@@ -189,9 +191,7 @@ class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):
                 else:
                     result_dict["quad"] = None
                 if warp_params is not None:
-                    result_dict["warp_params"] = [
-                        float(v) for v in warp_params[idx]
-                    ]
+                    result_dict["warp_params"] = [float(v) for v in warp_params[idx]]
 
                 results.append(result_dict)
                 box_idx_start = box_idx_end
@@ -415,9 +415,21 @@ class LayoutAnalysisTransformersPredictor(DetTransformersPredictor):
 
         output = {"boxes": formatted}
         if "polygon_points" in prediction:
-            output["polygon_points"] = [
-                np.asarray(points) for points in prediction["polygon_points"]
-            ]
+            points = prediction["polygon_points"]
+            if self.model_name == "PP-DocLayoutV4":
+                # V4 predicts quads in original-image coordinates. Keep them in
+                # the same filtering/sorting path as the Paddle engine outputs.
+                points = points.detach().cpu().numpy()
+                output["quad"] = points.reshape(len(formatted), 8)
+            else:
+                output["polygon_points"] = [np.asarray(p) for p in points]
+        if "warp_params" in prediction:
+            warp = prediction["warp_params"].detach().cpu().numpy()
+            if warp.shape != (5,):
+                raise ValueError(
+                    f"Expected page warp_params shape (5,), got {warp.shape}"
+                )
+            output["warp_params"] = warp
         return output
 
     def process(
@@ -462,12 +474,17 @@ class LayoutAnalysisTransformersPredictor(DetTransformersPredictor):
             skip_order_labels=skip_order_labels,
         )
 
-        return {
+        result = {
             "input_path": batch_data.input_paths,
             "page_index": batch_data.page_indexes,
             "input_img": [data["ori_img"] for data in datas],
             "boxes": boxes,
         }
+        if any("warp_params" in output for output in batch_outputs):
+            result["warp_params"] = [
+                output.get("warp_params") for output in batch_outputs
+            ]
+        return result
 
     def postprocess(self, outputs, *, datas, threshold, **kwargs):
         predictions = self.image_processor.post_process_object_detection(

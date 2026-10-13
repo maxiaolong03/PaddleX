@@ -7,7 +7,7 @@ comments: true
 ## I. Overview
 The layout analysis task builds upon layout area detection by further introducing **instance segmentation** and **reading order prediction** capabilities. By analyzing input document images, it not only identifies various layout elements (such as text, charts, images, formulas, paragraph titles, abstracts, references, etc.) and outputs their bounding boxes, but also simultaneously outputs the **precise contour mask** and **reading order index** for each region, providing more complete structural information for document understanding and information extraction workflows.
 
-The layout analysis module currently supports the PP-DocLayoutV3 model, which is based on the DETR architecture with PPHGNetV2-L as the backbone network. It adds a **reading order prediction** branch on top of the instance segmentation task, enabling end-to-end learning of reading order relationships among document elements.
+The layout analysis module supports PP-DocLayoutV3 and PP-DocLayoutV4 (see the V4 development notes below). PP-DocLayoutV3 is based on the DETR architecture with PPHGNetV2-L as the backbone network. It adds a **reading order prediction** branch on top of the instance segmentation task, enabling end-to-end learning of reading order relationships among document elements.
 
 ![layout analysis](https://raw.githubusercontent.com/cuicheng01/PaddleX_doc_images/refs/heads/main/images/modules/layout_analysis/layout_analysis.png)
 
@@ -610,7 +610,7 @@ Other related parameters can be set by modifying the fields under `Global` and `
 
 #### 4.4.2 Weight Conversion
 
-This module supports converting Paddle dynamic graph weights (`.pdparams`) to `safetensors` format for direct use with PaddleX's `paddle_dynamic` and `transformers` engines. Models supporting weight conversion in this module: `PP-DocLayoutV3`.
+This module supports converting Paddle dynamic graph weights (`.pdparams`) to `safetensors` format for direct use with PaddleX's `paddle_dynamic` and `transformers` engines. Models supporting weight conversion in this module: `PP-DocLayoutV3`, `PP-DocLayoutV4`.
 
 * To perform weight conversion via command line, taking `PP-DocLayoutV3` as an example:
 
@@ -641,3 +641,21 @@ The layout analysis module can be integrated into PaddleX pipelines such as the 
 2. <b>Module Integration</b>
 
 The weights you produce can be directly integrated into the layout analysis module. You can refer to the Python example code in the [Quick Integration](#quick) section, simply replacing the model with the path to your trained model.
+
+## PP-DocLayoutV4 development integration
+
+V4 shares the V3 backbone/encoder foundation, replaces instance masks with quadrilateral boxes, adds successor-based reading-order fusion, and optionally predicts page geometry. V4 uses `COCODetDataset` with COCO boxes, classes and `read_order`; segmentation annotations are not required. V3 still requires its instance masks.
+
+For the geometry-enabled epoch122 checkpoint, explicitly select the matching local model directory. Existing automatically downloaded weights are not guaranteed to contain the geometry head. Each geometry-enabled result includes page-level `warp_params` of shape `[5]`: rotation, quadrant confidence, shear, kx and ky. Legacy V4 models without the head omit this field.
+
+Training requires the updated PaddleDetection / LayoutModel branch with the geometry head and quadrilateral augmentation operators. Evaluation also requires `get_det_res_with_order` to accept the 11-column quadrilateral-plus-order output. A V3-only dependency is insufficient.
+
+The default `PP-DocLayoutV4.yaml` freezes the detector and trains the geometry head. Set `Train.pretrain_weight_path` to a trained V4 detector or epoch122 checkpoint. For detector training, set `Train.basic_config_path` to `paddlex/repo_apis/PaddleDetection_api/configs/PP-DocLayoutV4_det.yaml`. Both recipes use background augmentation: copy the base configuration and set `RandomSceneBackgroundQuad.bg_dir` to a real text-free background dataset.
+
+Use `Global.mode=evaluate` / `export` and `Evaluate.weight_path` / `Export.weight_path` for evaluation/export. For custom architectures, also supply the matching `Evaluate.basic_config_path` / `Export.basic_config_path`. The metric decodes reading order but reports enclosing axis-aligned COCO box AP, not quadrilateral AP or a separate reading-order accuracy.
+
+V4 also supports `Global.mode=pdparams2safetensors`, with `Pdparams2safetensors.input_path` and `Pdparams2safetensors.output_dir` selecting the checkpoint and destination.
+
+For PaddleOCR-VL-1.8, set `SubModules.LayoutDetection.model_dir` to the matching model and enable `use_layout_deform=True` (disabled by default). `layout_deform_conf_thresh` defaults to 0.9. Geometry belongs to the page and remains independent of box filtering and sorting.
+
+The `transformers` engine requires a Transformers implementation supporting `pp_doclayout_v4` and its geometry head. PaddleX preserves its quadrilaterals and page `warp_params`; a V3-only Transformers version cannot load V4. Registration of other engines/devices does not establish epoch122 compatibility or accuracy validation.

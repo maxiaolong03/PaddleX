@@ -519,7 +519,7 @@ PP_DOCLAYOUTV2_MAPPING = RTDETR_MAPPING + [
 # PP-DocLayoutV4 extends RTDETR with the ROOR (direct-successor) reading-order
 # head and the S2R fusion module. RTDETR_MAPPING already covers the relative
 # order head (``dec_order_head`` / ``dec_global_pointer``), which V4 shares, so
-# only the three V4-only prefixes are added here.
+# current upstream names and the geometric head are mapped alongside legacy aliases.
 #
 # Ownership matters: the order heads, global pointers and s2r_fusion are
 # attributes of RTDETRTransformerV2 and are merely *passed into*
@@ -531,6 +531,14 @@ PP_DOCLAYOUTV2_MAPPING = RTDETR_MAPPING + [
 # there is no ``s2r_fusion.b`` key in the checkpoint -- the value lives in the
 # config (``s2r_b_init``) instead.
 PP_DOCLAYOUTV4_MAPPING = RTDETR_MAPPING + [
+    # Current upstream names, with legacy aliases retained below.
+    (r"^transformer\.dec_rel_head\.", r"model.decoder_order_head."),
+    (r"^transformer\.rel_scorer\.", r"model.decoder_global_pointer."),
+    (r"^transformer\.dec_succ_head\.", r"model.decoder_roor_order_head."),
+    (r"^transformer\.succ_scorer\.", r"model.decoder_roor_global_pointer."),
+    (r"^transformer\.s2r\.", r"model.s2r_fusion."),
+    (r"^detr_head\.deform_head\.", r"model.deform_head."),
+    (r"^detr_head\.deform_bin_centers$", r"model.deform_bin_centers"),
     (
         r"^transformer\.dec_roor_order_head\.",
         r"model.decoder_roor_order_head.",

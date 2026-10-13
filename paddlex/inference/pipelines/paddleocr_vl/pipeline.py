@@ -201,6 +201,9 @@ class _PaddleOCRVLPipeline(BasePipeline):
             # deformation (`warp_params`), and on an undeformed page the
             # correction only costs a resampling step.
             self.use_layout_deform = config.get("use_layout_deform", False)
+            self.layout_deform_conf_thresh = config.get(
+                "layout_deform_conf_thresh", DEFAULT_CONF_THRESH
+            )
             # Gate for the fine deformation, in degrees (see plan_page_correction).
             self.layout_deform_min_roll = config.get(
                 "layout_deform_min_roll", DEFAULT_MIN_ROLL
@@ -955,7 +958,7 @@ class _PaddleOCRVLPipeline(BasePipeline):
         layout_merge_bboxes_mode: Optional[str] = None,
         layout_shape_mode: Optional[str] = "auto",
         use_layout_deform: Optional[bool] = None,
-        layout_deform_conf_thresh: float = DEFAULT_CONF_THRESH,
+        layout_deform_conf_thresh: Optional[float] = None,
         layout_deform_min_roll: Optional[float] = None,
         layout_deform_min_shear: Optional[float] = None,
         layout_deform_min_keystone: Optional[float] = None,
@@ -998,8 +1001,9 @@ class _PaddleOCRVLPipeline(BasePipeline):
                 model predicts (`warp_params`: roll, shear, keystone). Requires a
                 layout model that emits it; has no effect otherwise. Default is
                 None, which falls back to the pipeline config (off unless set).
-            layout_deform_conf_thresh (float): Minimum quadrant confidence for the
-                predicted deformation to be applied. Below it the plain crop is
+            layout_deform_conf_thresh (Optional[float]): Minimum quadrant confidence for the
+                predicted deformation to be applied. None uses the pipeline config.
+                Below it the plain crop is
                 kept, because a wrong quarter turn hurts recognition more than no
                 correction. Defaults to 0.9.
             layout_deform_min_roll, layout_deform_min_shear,
@@ -1177,7 +1181,11 @@ class _PaddleOCRVLPipeline(BasePipeline):
                 merge_layout_blocks=model_settings["merge_layout_blocks"],
                 layout_shape_mode=layout_shape_mode,
                 use_layout_deform=model_settings["use_layout_deform"],
-                layout_deform_conf_thresh=layout_deform_conf_thresh,
+                layout_deform_conf_thresh=(
+                    self.layout_deform_conf_thresh
+                    if layout_deform_conf_thresh is None
+                    else layout_deform_conf_thresh
+                ),
                 layout_deform_min_roll=(
                     self.layout_deform_min_roll
                     if layout_deform_min_roll is None

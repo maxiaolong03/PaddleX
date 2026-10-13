@@ -129,6 +129,18 @@ class PPDocLayoutV4Config(PretrainedConfig):
         # 4-point quad box parameterization
         self.num_coords = kwargs.get("num_coords", 10)
 
+        # Optional page rectification head; legacy five-output models omit it.
+        self.deform_pred = kwargs.get("deform_pred", False)
+        self.deform_out = kwargs.get("deform_out", self.deform_pred)
+        self.deform_level = kwargs.get("deform_level", 1)
+        self.deform_conv_width = kwargs.get("deform_conv_width", 128)
+        self.deform_kbins = kwargs.get("deform_kbins", 41)
+        self.deform_krange = kwargs.get("deform_krange", 1.5)
+        if self.deform_out and not self.deform_pred:
+            raise ValueError("deform_out requires deform_pred")
+        if self.deform_kbins < 2:
+            raise ValueError("deform_kbins must be at least 2")
+
         # Reading order: relative-order head + ROOR head + S2R fusion
         self.global_pointer_head_size = kwargs.get("global_pointer_head_size", 64)
         self.gp_dropout_value = kwargs.get("gp_dropout_value", 0.1)

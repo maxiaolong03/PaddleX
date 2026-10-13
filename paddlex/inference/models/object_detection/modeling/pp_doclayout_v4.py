@@ -15,7 +15,7 @@
 """Dynamic-graph PP-DocLayoutV4, for loading the safetensors package.
 
 PP-DocLayoutV4 is PP-DocLayoutV3's backbone/encoder/decoder stack with the mask
-branch removed and three things added:
+branch removed and the following additions:
 
 * ``num_coords = 10`` -- the bbox heads regress a 4-point quad as
   ``[cx, cy, dx1, dy1, ..., dx4, dy4]`` in sigmoid space instead of a
@@ -29,6 +29,9 @@ branch removed and three things added:
   Unlike V3, the reading order is NOT decoded in the graph -- the raw
   ``rel``/``roor`` logit matrices and the query indices are returned so that
   ``LayoutAnalysisProcess`` can run the DAG decode on the filtered boxes.
+
+* optional page deformation prediction from stride-16 encoder features,
+  returning rectifying (roll, confidence, shear, kx, ky) parameters.
 
 Everything that is bit-identical to V3 (backbone, AIFI, deformable attention,
 decoder layer, CSPRep/RepVgg blocks, ...) is imported from
@@ -345,6 +348,45 @@ class PPDocLayoutV4Decoder(nn.Layer):
             "roor_order_logits": roor_logits,
         }
 
+
+class PPDocLayoutV4DeformConvHead(nn.Layer):
+    """Dilated conv stack over one encoder level + 2 normalised coordinate
+    channels, followed by spatial-softmax attention pooling.
+
+    Each location emits one attention logit and a full ``out_dim`` prediction;
+    the prediction is the attention-weighted sum.  Local geometric evidence
+    (page edges, text-line slopes) is read where it occurs, and the coordinate
+    channels tell every location where it sits relative to the canvas centre,
+    which the canvas-referenced (roll, shear, kx, ky) need.  The receptive field
+    is 15 cells (~240px at stride 16).
+
+    Parameters live under ``deform_head.body.*``; the ``deform_head`` prefix is
+    what ``deform_only_train`` keeps trainable.
+    """
+
+    def __init__(self, in_ch, out_dim, width=128):
+        super(PPDocLayoutV4DeformConvHead, self).__init__()
+        self.body = nn.Sequential(
+            nn.Conv2D(in_ch + 2, width, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2D(width, width, 3, padding=2, dilation=2),
+            nn.ReLU(),
+            nn.Conv2D(width, width, 3, padding=4, dilation=4),
+            nn.ReLU(),
+            nn.Conv2D(width, out_dim + 1, 1),
+        )
+
+    def forward(self, feat):
+        shp = paddle.shape(feat)
+        ys = paddle.linspace(-1.0, 1.0, shp[2], dtype=feat.dtype)
+        xs = paddle.linspace(-1.0, 1.0, shp[3], dtype=feat.dtype)
+        gy, gx = paddle.meshgrid(ys, xs)
+        coord = paddle.stack([gx, gy], 0).unsqueeze(0) + paddle.zeros_like(feat[:, :2])
+        o = self.body(paddle.concat([feat, coord], 1)).flatten(2)
+        att = F.softmax(o[:, :1], axis=-1)
+        return (att * o[:, 1:]).sum(-1)
+
+
 class PPDocLayoutV4Model(nn.Layer):
     def __init__(self, config):
         super().__init__()
@@ -371,6 +413,18 @@ class PPDocLayoutV4Model(nn.Layer):
         self.encoder_input_proj = nn.LayerList(encoder_input_proj_list[1:])
 
         self.encoder = PPDocLayoutV4HybridEncoder(config)
+        if config.deform_pred:
+            self.deform_head = PPDocLayoutV4DeformConvHead(
+                config.encoder_hidden_dim,
+                6 + 2 * config.deform_kbins,
+                config.deform_conv_width,
+            )
+            self.register_buffer(
+                "deform_bin_centers",
+                paddle.linspace(
+                    -config.deform_krange, config.deform_krange, config.deform_kbins
+                ),
+            )
 
         self.denoising_class_embed = nn.Embedding(config.num_labels, config.d_model)
         if config.learn_initial_query:
@@ -524,7 +578,7 @@ class PPDocLayoutV4Model(nn.Layer):
                 axis=1,
             )
 
-        return self.decoder(
+        outputs = self.decoder(
             inputs_embeds=target,
             encoder_hidden_states=source_flatten,
             reference_points=reference_points_unact,
@@ -537,6 +591,23 @@ class PPDocLayoutV4Model(nn.Layer):
             roor_global_pointer=self.decoder_roor_global_pointer,
             s2r_fusion=self.s2r_fusion,
         )
+        if self.config.deform_pred and self.config.deform_out:
+            raw = self.deform_head(encoder_outputs[self.config.deform_level].detach())
+            prob = F.softmax(raw[:, :4], axis=-1)
+            quadrant = paddle.argmax(prob, axis=-1).astype(raw.dtype)
+            angle = 90.0 * quadrant + 45.0 * raw[:, 4]
+            angle = (
+                paddle.mod(angle + 180.0, paddle.full([1], 360.0, dtype=raw.dtype))
+                - 180.0
+            )
+            bins = self.config.deform_kbins
+            centers = self.deform_bin_centers.astype(raw.dtype)
+            kx = (F.softmax(raw[:, 6 : 6 + bins], axis=-1) * centers).sum(-1)
+            ky = (F.softmax(raw[:, 6 + bins : 6 + 2 * bins], axis=-1) * centers).sum(-1)
+            outputs["warp_params"] = paddle.stack(
+                [angle, prob.max(-1), 45.0 * raw[:, 5], kx, ky], axis=-1
+            )
+        return outputs
 
 class PPDocLayoutV4PostProcess:
     """Decode quads to absolute corners and select the top-k query/class pairs.
@@ -618,11 +689,9 @@ class PPDocLayoutV4(BatchNormHFStateDictMixin, PretrainedModel):
         )
 
     def forward(self, inputs):
-        """Return the same five tensors the exported static graph produces.
+        """Return detection/order tensors and optional trailing [B, 5] warp_params.
 
-        ``inputs`` is the ordered batch ``(img_size, img, scale_factors)`` built
-        by ``LayoutAnalysisRunnerPredictor.build_to_batch``; the five outputs hit
-        the ``len(pred) == 5`` branch of ``_format_output``.
+        Inputs are (img_size, img, scale_factors), matching the static runner.
         """
         im_shape = paddle.to_tensor(inputs[0])
         pixel_values = paddle.to_tensor(inputs[1])
@@ -640,7 +709,10 @@ class PPDocLayoutV4(BatchNormHFStateDictMixin, PretrainedModel):
             im_shape,
             scale_factor,
         )
-        return [bbox, bbox_num, qi, rel_logits, roor_logits]
+        outputs = [bbox, bbox_num, qi, rel_logits, roor_logits]
+        if "warp_params" in decoder_outputs:
+            outputs.append(decoder_outputs["warp_params"])
+        return outputs
 
     def get_transpose_weight_keys(self):
         t_layers = [
