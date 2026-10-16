@@ -42,6 +42,11 @@ class InferRequest(OutputFormatsMixin, ocr.BaseInferRequest):
     useDocOrientationClassify: Optional[bool] = None
     useDocUnwarping: Optional[bool] = None
     useLayoutDetection: Optional[bool] = None
+    useLayoutDeform: Optional[bool] = None
+    layoutDeformConfThresh: Optional[float] = None
+    layoutDeformMinRoll: Optional[float] = None
+    layoutDeformMinShear: Optional[float] = None
+    layoutDeformMinKeystone: Optional[float] = None
     useChartRecognition: Optional[bool] = None
     useSealRecognition: Optional[bool] = None
     useOcrForImageBlock: Optional[bool] = None
