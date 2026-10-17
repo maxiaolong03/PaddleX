@@ -538,7 +538,7 @@ PP_DOCLAYOUTV4_MAPPING = RTDETR_MAPPING + [
     (r"^transformer\.succ_scorer\.", r"model.decoder_roor_global_pointer."),
     (r"^transformer\.s2r\.", r"model.s2r_fusion."),
     (r"^detr_head\.deform_head\.", r"model.deform_head."),
-    (r"^detr_head\.deform_bin_centers$", r"model.deform_bin_centers"),
+    (r"^detr_head\.deform_bin_centers$", r"model.deform_head.bin_centers"),
     (
         r"^transformer\.dec_roor_order_head\.",
         r"model.decoder_roor_order_head.",

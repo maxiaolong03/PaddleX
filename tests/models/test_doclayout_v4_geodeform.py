@@ -215,3 +215,97 @@ def test_pipeline_reads_deformation_confidence_config(monkeypatch):
     assert pipeline.use_layout_deform is True
     assert pipeline.layout_deform_conf_thresh == 0.75
     pipeline.close()
+
+
+@pytest.mark.parametrize("head", ["rel_scorer", "succ_scorer"])
+def test_global_pointer_conversion_preserves_query_key_projections(head, tmp_path):
+    import paddle
+    from paddlex.inference.models.object_detection.modeling.pp_doclayout_v4 import (
+        PPDocLayoutV4GlobalPointer,
+    )
+    from types import SimpleNamespace
+
+    # Non-square, non-symmetric values distinguish transposition, interleaving
+    # and swapping the query/key halves, including the bias.
+    weight = np.arange(24, dtype="float32").reshape(3, 8) / 20
+    bias = np.arange(8, dtype="float32") / 10
+    checkpoint = tmp_path / "weights.pdparams"
+    centers = np.array([-1.5, -0.4, 0.1, 1.5], dtype="float32")
+    paddle.save(
+        {
+            f"transformer.{head}.dense.weight": weight,
+            f"transformer.{head}.dense.bias": bias,
+            "detr_head.deform_bin_centers": centers,
+        },
+        str(checkpoint),
+    )
+    converter = WeightConverter(
+        SimpleNamespace(
+            Global=SimpleNamespace(model="PP-DocLayoutV4"),
+            Pdparams2safetensors={
+                "input_path": str(checkpoint),
+                "output_dir": str(tmp_path / "converted"),
+            },
+        )
+    )
+    converted = converter._convert_weights(PP_DOCLAYOUTV4_MAPPING, [])
+    np.testing.assert_array_equal(converted["model.deform_head.bin_centers"], centers)
+    name = (
+        "decoder_global_pointer"
+        if head == "rel_scorer"
+        else "decoder_roor_global_pointer"
+    )
+    prefix = f"model.{name}."
+    x = np.arange(18, dtype="float32").reshape(2, 3, 3) / 10
+    q = x @ converted[prefix + "q_proj.weight"].T + converted[prefix + "q_proj.bias"]
+    k = x @ converted[prefix + "k_proj.weight"].T + converted[prefix + "k_proj.bias"]
+    expected = q @ k.transpose(0, 2, 1) / 2
+    antisymmetric = head == "rel_scorer"
+    expected = (
+        expected - expected.transpose(0, 2, 1)
+        if antisymmetric
+        else expected - np.eye(3) * 1e4
+    )
+    layer = PPDocLayoutV4GlobalPointer(
+        SimpleNamespace(global_pointer_head_size=4, d_model=3, gp_dropout_value=0),
+        antisymmetric,
+    )
+    layer.dense.weight.set_value(weight)
+    layer.dense.bias.set_value(bias)
+    layer.eval()
+    np.testing.assert_allclose(
+        layer(paddle.to_tensor(x)).numpy(), expected, atol=1e-4, rtol=1e-5
+    )
+
+
+def test_legacy_and_current_geometry_buffer_names():
+    import paddle
+    from paddlex.inference.models.object_detection.modeling.pp_doclayout_v4 import (
+        PPDocLayoutV4,
+    )
+
+    # Preserve an irregular buffer rather than regenerating it from its range.
+    centers = paddle.to_tensor([-1.5, -0.4, 0.1, 1.5])
+    canonical = PPDocLayoutV4._normalize_hf_geometry_keys(
+        {"model.deform_bin_centers": centers}
+    )
+    assert canonical["model.deform_head.bin_centers"] is centers
+    with pytest.raises(ValueError, match="both geometry"):
+        PPDocLayoutV4._normalize_hf_geometry_keys(
+            {**canonical, "model.deform_bin_centers": centers}
+        )
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["model.decoder_global_pointer.q_proj.weight", "model.deform_head.bin_centers"],
+)
+def test_loading_rejects_missing_critical_weights(key):
+    from types import SimpleNamespace
+    from paddlex.inference.models.object_detection.modeling.pp_doclayout_v4 import (
+        PPDocLayoutV4,
+    )
+
+    model = SimpleNamespace(get_hf_state_dict=lambda: {key: None})
+    with pytest.raises(ValueError, match="missing critical weights"):
+        PPDocLayoutV4._load_pretrained_model(model, {}, [], convert_from_hf=True)

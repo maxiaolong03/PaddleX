@@ -143,6 +143,26 @@ def _derive_doclayoutv4_s2r_config(config, numpy_sd):
     return config
 
 
+def _split_doclayoutv4_projections(state_dict):
+    """Use the Transformers q/k and geometry-buffer names in V4 packages.
+
+    Linear tensors have already been transposed to HF [out, in] format.
+    The original fused projection stores all queries followed by all keys.
+    """
+    import numpy as np
+
+    state_dict = dict(state_dict)
+    for head in ("decoder_global_pointer", "decoder_roor_global_pointer"):
+        prefix = f"model.{head}."
+        for suffix in ("weight", "bias"):
+            fused = prefix + "dense." + suffix
+            if fused in state_dict:
+                q, k = np.split(state_dict.pop(fused), 2, axis=0)
+                state_dict[prefix + "q_proj." + suffix] = q
+                state_dict[prefix + "k_proj." + suffix] = k
+    return state_dict
+
+
 def _derive_doclayoutv4_deform_config(config, numpy_sd):
     """Recover the optional geometric head architecture from checkpoint tensors."""
     config = dict(config)
@@ -155,11 +175,11 @@ def _derive_doclayoutv4_deform_config(config, numpy_sd):
             for i in (0, 2, 4, 6)
             for suffix in (".weight", ".bias")
         ]
-        required.append("model.deform_bin_centers")
+        required.append("model.deform_head.bin_centers")
         missing = [key for key in required if key not in numpy_sd]
         if missing:
             raise ValueError(f"Incomplete PP-DocLayoutV4 deformation head: {missing}")
-        centers = numpy_sd["model.deform_bin_centers"]
+        centers = numpy_sd["model.deform_head.bin_centers"]
         bins = int(centers.size)
         if bins < 2 or numpy_sd[prefix + "6.weight"].shape[0] != 7 + 2 * bins:
             raise ValueError("Inconsistent deformation bin count and output channels")
@@ -557,6 +577,9 @@ class WeightConverter:
                 f"No key mapping defined for {self.model_name}. "
                 "Keys will be saved as-is from pdparams."
             )
+
+        if self.model_name == "PP-DocLayoutV4":
+            numpy_sd = _split_doclayoutv4_projections(numpy_sd)
 
         self._postprocess_weights(numpy_sd)
         return numpy_sd
