@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+import os
+
 from ..object_detection import DetEvaluator
 from .dataset_spec import get_dataset_spec
 from .model_list import MODELS
@@ -40,3 +42,9 @@ class LayoutAnalysisEvaluator(DetEvaluator):
             metric=metric,
         )
         self.pdx_config.update_weights(self.eval_config.weight_path)
+        # Workers run from the external repository; relative metric outputs
+        # would otherwise write bbox.json into that checkout.
+        output_dir = os.path.abspath(self.global_config.output)
+        os.makedirs(output_dir, exist_ok=True)
+        self.pdx_config.update_save_dir(output_dir)
+        self.pdx_config.update({"output_eval": output_dir})

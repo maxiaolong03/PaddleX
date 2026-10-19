@@ -400,6 +400,17 @@ class LayoutAnalysisTransformersPredictor(DetTransformersPredictor):
                 return list(target_size)
         return [800, 800]
 
+    def preprocess_images(self, images, **kwargs):
+        if self.model_name == "PP-DocLayoutV4" and kwargs.get("do_resize", True):
+            # Match the Paddle engines exactly: tensor bicubic interpolation has
+            # different uint8 rounding, which changes the page geometry output.
+            resize = Resize(
+                target_size=self._resolve_scale_size()[::-1], interp="BICUBIC"
+            )
+            images = [Image.fromarray(resize.resize(np.asarray(im))) for im in images]
+            kwargs["do_resize"] = False
+        return super().preprocess_images(images, **kwargs)
+
     def _format_layout_transformers_output(self, prediction):
         formatted = self._format_transformers_output(prediction)
         if "order_seq" in prediction:

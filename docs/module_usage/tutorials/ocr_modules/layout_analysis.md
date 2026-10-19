@@ -8,7 +8,7 @@ comments: true
 
 版面分析任务在版面区域检测的基础上，进一步引入了**实例分割**与**阅读顺序预测**能力。通过对输入的文档图像进行分析，不仅能识别各类版面元素（如文字、图表、图像、公式、段落标题、摘要、参考文献等）并输出其边界框，还能同时输出每个区域的**精确轮廓掩码**和**阅读顺序编号**，为文档理解与信息抽取流程提供更完整的结构化信息。
 
-版面分析模块支持 PP-DocLayoutV3 和 PP-DocLayoutV4（V4 开发版配置见文末）。PP-DocLayoutV3 基于 DETR 架构并以 PPHGNetV2-L 为骨干网络，在实例分割任务之上增加了**阅读顺序预测**分支，可端到端学习文档元素的阅读顺序关系。
+版面分析模块目前支持模型 PP-DocLayoutV3，基于 DETR 架构并以 PPHGNetV2-L 为骨干网络，在实例分割任务之上增加了**阅读顺序预测**分支，可端到端学习文档元素的阅读顺序关系。
 
 ![版面分析效果](https://raw.githubusercontent.com/cuicheng01/PaddleX_doc_images/refs/heads/main/images/modules/layout_analysis/layout_analysis.png)
 
@@ -625,7 +625,7 @@ python main.py -c paddlex/configs/modules/layout_analysis/PP-DocLayoutV3.yaml \
 
 #### 4.4.2 权重转换
 
-本模块支持将 Paddle 动态图权重（`.pdparams`）转换为 `safetensors` 格式，方便在 PaddleX 的 `paddle_dynamic` 和 `transformers` 引擎中直接加载使用。支持权重转换的模型包括：`PP-DocLayoutV3`、`PP-DocLayoutV4`。
+本模块支持将 Paddle 动态图权重（`.pdparams`）转换为 `safetensors` 格式，方便在 PaddleX 的 `paddle_dynamic` 和 `transformers` 引擎中直接加载使用。支持权重转换的模型包括：`PP-DocLayoutV3`。
 
 * 通过命令行的方式进行权重转换，以 `PP-DocLayoutV3` 模型为例：
 
@@ -656,40 +656,3 @@ python main.py -c paddlex/configs/modules/layout_analysis/PP-DocLayoutV3.yaml \
 2. <b>模块集成</b>
 
 您产出的权重可以直接集成到版面分析模块中，可以参考[快速集成](#三快速集成)的 Python 示例代码，只需要将模型替换为你训练的到的模型路径即可。
-
-## PP-DocLayoutV4 开发版使用说明
-
-PP-DocLayoutV4 复用 V3 的骨干与编码器基础结构，以四点框替代实例掩码，并增加后继阅读顺序融合和可选的页面几何预测头。V4 数据集使用 `COCODetDataset`，需要 COCO `bbox`、类别和 `read_order`，不要求 `segmentation`；四点标注由数据读取与增强流程生成。V3 仍使用实例分割标注，不能直接删除其 `segmentation`。
-
-对于包含页面几何头的 epoch122 权重，请显式传入对应的本地模型目录；按模型名自动下载的既有权重不保证包含该头。静态图与 `paddle_dynamic` 的版面结果保留四点坐标和阅读顺序；几何模型额外返回页面级 `warp_params`，形状为 `[5]`，依次为旋转角、象限置信度、剪切角、kx、ky。无几何头的旧 V4 模型不返回此字段。
-
-### 训练、评估与导出
-
-训练依赖支持 `DINOHeadV2` 几何头和新版四点增强算子的 PaddleDetection / LayoutModel 分支。不能用仅支持 V3 的旧版依赖替代。评估时依赖库的 `get_det_res_with_order` 还必须支持带顺序的 11 列四点框输出。
-
-默认 `PP-DocLayoutV4.yaml` 为冻结检测器、仅训练几何头的配置，必须指定训练好的检测器或 epoch122 checkpoint：
-
-```bash
-python main.py -c paddlex/configs/modules/layout_analysis/PP-DocLayoutV4.yaml \
-  -o Global.mode=train Global.dataset_dir=/path/to/dataset \
-  Train.pretrain_weight_path=/path/to/122.pdparams
-```
-
-训练检测器时，通过 `Train.basic_config_path` 指定 `paddlex/repo_apis/PaddleDetection_api/configs/PP-DocLayoutV4_det.yaml`。检测器和几何头两套配置都使用自然背景增强，请在复制的底层配置中将 `RandomSceneBackgroundQuad.bg_dir` 设置为实际无文本背景目录，再通过 `Train.basic_config_path` 使用该配置。
-
-评估与导出可通过 `Global.mode=evaluate` / `Global.mode=export` 和 `Evaluate.weight_path` / `Export.weight_path` 调用；自定义结构应同时指定对应的 `Evaluate.basic_config_path` / `Export.basic_config_path`。`DocLayoutV3Metric` 会解码阅读顺序，但当前汇报轴对齐外接矩形 COCO AP，不包含四点框 AP 或独立的阅读顺序准确率。
-
-权重转换同样支持 V4：
-
-```bash
-python main.py -c paddlex/configs/modules/layout_analysis/PP-DocLayoutV4.yaml \
-  -o Global.mode=pdparams2safetensors \
-  Pdparams2safetensors.input_path=/path/to/122.pdparams \
-  Pdparams2safetensors.output_dir=/path/to/converted_model
-```
-
-### PaddleOCR-VL-1.8 接入
-
-将产线配置中 `SubModules.LayoutDetection.model_dir` 指向对应模型目录，通过 `use_layout_deform=True` 开启逐块几何矫正，默认关闭。可以配置 `layout_deform_conf_thresh`（默认 0.9）以及旋转、剪切、透视阈值。几何参数随页面传递，不随检测框过滤或排序改变。
-
-`transformers` 引擎需要安装支持 `pp_doclayout_v4` 及几何头的 Transformers 实现；PaddleX 适配器保留该实现输出的四点坐标和 `warp_params`。仅有 V3 支持的 Transformers 版本不足以加载 V4。其他推理引擎／设备的注册不等于已完成 epoch122 兼容性和精度验证。

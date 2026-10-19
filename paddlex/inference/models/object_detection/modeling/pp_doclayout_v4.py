@@ -750,16 +750,94 @@ class PPDocLayoutV4(BatchNormHFStateDictMixin, PretrainedModel):
                     and "enc_output.1" not in key
                 ):
                     keys.append(key)
+        keys.extend(
+            f"model.{head}.dense.weight"
+            for head in ("decoder_global_pointer", "decoder_roor_global_pointer")
+        )
         return keys
 
+    @staticmethod
+    def _normalize_hf_geometry_keys(state_dict):
+        state_dict = dict(state_dict)
+        old_key = "model.deform_bin_centers"
+        new_key = "model.deform_head.bin_centers"
+        if old_key in state_dict:
+            if new_key in state_dict:
+                raise ValueError("Checkpoint contains both geometry bin-center names")
+            state_dict[new_key] = state_dict.pop(old_key)
+        return state_dict
+
+    @classmethod
+    def _load_pretrained_model(cls, model, state_dict, loaded_keys, **kwargs):
+        if kwargs.get("convert_from_hf"):
+            # HF tensors have already been transposed to Paddle's [in, out]
+            # layout by load_state_dict. Accept the former fused format too.
+            if state_dict is not None:
+                state_dict = cls._normalize_hf_geometry_keys(state_dict)
+                for head in ("decoder_global_pointer", "decoder_roor_global_pointer"):
+                    prefix = f"model.{head}."
+                    for suffix in ("weight", "bias"):
+                        fused = prefix + "dense." + suffix
+                        if fused in state_dict:
+                            if any(
+                                prefix + part + "." + suffix in state_dict
+                                for part in ("q_proj", "k_proj")
+                            ):
+                                raise ValueError(
+                                    f"Checkpoint contains fused and split projections for {prefix}"
+                                )
+                            q, k = paddle.split(state_dict.pop(fused), 2, axis=-1)
+                            state_dict[prefix + "q_proj." + suffix] = q
+                            state_dict[prefix + "k_proj." + suffix] = k
+                # PyTorch BatchNorm counters have no Paddle equivalent.
+                state_dict = {
+                    k: v
+                    for k, v in state_dict.items()
+                    if not k.endswith(".num_batches_tracked")
+                }
+                loaded_keys = list(state_dict)
+            expected = model.get_hf_state_dict()
+            critical = [
+                k for k in expected if "global_pointer." in k or ".deform_head." in k
+            ]
+            missing = sorted(set(critical) - set(loaded_keys))
+            if missing:
+                raise ValueError(
+                    f"Incomplete PP-DocLayoutV4 checkpoint; missing critical weights: {missing}"
+                )
+        return super()._load_pretrained_model(model, state_dict, loaded_keys, **kwargs)
+
     def set_hf_state_dict(self, state_dict, *args, **kwargs):
-        # V4's bbox/class heads are untied, so unlike V3 there are no aliases to
-        # synthesize here -- only the RT-DETR naming bridge is needed.
+        state_dict = self._normalize_hf_geometry_keys(state_dict)
+        for head in ("decoder_global_pointer", "decoder_roor_global_pointer"):
+            prefix = f"model.{head}."
+            for suffix in ("weight", "bias"):
+                q, k = (prefix + part + "." + suffix for part in ("q_proj", "k_proj"))
+                if q in state_dict or k in state_dict:
+                    if q not in state_dict or k not in state_dict:
+                        raise ValueError(
+                            f"Incomplete query/key projection pair for {prefix}{suffix}"
+                        )
+                    state_dict[prefix + "dense." + suffix] = paddle.concat(
+                        [state_dict.pop(q), state_dict.pop(k)], axis=-1
+                    )
+        key = "model.deform_head.bin_centers"
+        if key in state_dict:
+            state_dict["model.deform_bin_centers"] = state_dict.pop(key)
         return super().set_hf_state_dict(
             _apply_rt_detr_key_conversion(state_dict), *args, **kwargs
         )
 
     def get_hf_state_dict(self, *args, **kwargs):
-        return _reverse_rt_detr_key_conversion(
+        state_dict = _reverse_rt_detr_key_conversion(
             super().get_hf_state_dict(*args, **kwargs)
         )
+        for head in ("decoder_global_pointer", "decoder_roor_global_pointer"):
+            prefix = f"model.{head}."
+            for suffix in ("weight", "bias"):
+                q, k = paddle.split(
+                    state_dict.pop(prefix + "dense." + suffix), 2, axis=-1
+                )
+                state_dict[prefix + "q_proj." + suffix] = q
+                state_dict[prefix + "k_proj." + suffix] = k
+        return self._normalize_hf_geometry_keys(state_dict)

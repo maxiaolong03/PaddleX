@@ -25,6 +25,9 @@ class LayoutAnalysisTrainer(DetTrainer):
 
     def update_config(self):
         super().update_config()
+        # Training-time validation must also keep bbox.json out of the
+        # external PaddleDetection working directory.
+        self.pdx_config.update({"output_eval": self.pdx_config.save_dir})
         if (
             self.global_config.model == "PP-DocLayoutV4"
             and self.pdx_config.dict.get("deform_only_train", False)
