@@ -182,6 +182,7 @@ EXTRAS = {
             "shapely",
         ],
         "ocr": [
+            "python-docx",
             "einops",
             "ftfy",
             "imagesize",
@@ -345,6 +346,7 @@ def packages_and_package_data():
     ]
     pkg_data.extend(pipeline_config)
     pkg_data.append("inference/pipelines/ppchatocrv3/ch_prompt.yaml")
+    pkg_data.append("inference/common/result/converter/MML2OMML.XSL")
     pkg_data.append("hpip_links.html")
     pkg_data.append("hpip_links_cu12.html")
     pkg_data.append("inference/models/runners/hpi/hpi_model_info_collection.json")

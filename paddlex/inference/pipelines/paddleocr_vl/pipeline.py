@@ -62,6 +62,11 @@ from .uilts import (
 IMAGE_LABELS = ["image", "header_image", "footer_image"]
 
 
+def _is_uniform_image(image):
+    """Only discard truly uniform pages; preserve even one-level contrast."""
+    return bool(image.size and np.all(image == image[0, 0]))
+
+
 @lru_cache(maxsize=1)
 def _load_mineru_block_content_to_html():
     """Resolve MinerU2.5's table converter lazily.
@@ -1143,6 +1148,16 @@ class _PaddleOCRVLPipeline(BasePipeline):
                             }
                         )
                     imgs_in_doc = [[] for _ in layout_det_results]
+
+                # Uniform pages cannot contain text. Layout false positives on
+                # them otherwise send empty crops to the VLM, which may hallucinate.
+                # Use exact equality so faint text is never removed by a threshold.
+                for image, layout_res, page_images in zip(
+                    doc_preprocessor_images, layout_det_results, imgs_in_doc
+                ):
+                    if _is_uniform_image(image):
+                        layout_res["boxes"] = []
+                        page_images.clear()
 
                 yield input_paths, page_indexes, page_counts, doc_preprocessor_images, doc_preprocessor_results, layout_det_results, imgs_in_doc
 
