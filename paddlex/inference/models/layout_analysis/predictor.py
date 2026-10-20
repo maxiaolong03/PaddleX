@@ -262,7 +262,7 @@ class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):
         self,
         batch_data: List[Any],
         threshold: Optional[Union[float, dict]] = None,
-        layout_nms: bool = False,
+        layout_nms: Optional[bool] = None,
         layout_unclip_ratio: Optional[Union[float, Tuple[float, float], dict]] = None,
         layout_merge_bboxes_mode: Optional[Union[str, dict]] = None,
         layout_shape_mode: Optional[str] = "auto",
@@ -304,7 +304,7 @@ class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):
             preds_list,
             datas,
             threshold=threshold if threshold is not None else self.threshold,
-            layout_nms=layout_nms or self.layout_nms,
+            layout_nms=self.layout_nms if layout_nms is None else layout_nms,
             layout_unclip_ratio=layout_unclip_ratio or self.layout_unclip_ratio,
             layout_merge_bboxes_mode=layout_merge_bboxes_mode
             or self.layout_merge_bboxes_mode,
@@ -362,7 +362,7 @@ class LayoutAnalysisRunnerPredictor(DetRunnerPredictor):
     def build_postprocess(self):
         if self.threshold is None:
             self.threshold = self.config.get("draw_threshold", 0.5)
-        if not self.layout_nms:
+        if self.layout_nms is None:
             self.layout_nms = self.config.get("layout_nms", None)
         if self.layout_unclip_ratio is None:
             self.layout_unclip_ratio = self.config.get("layout_unclip_ratio", None)
@@ -447,7 +447,7 @@ class LayoutAnalysisTransformersPredictor(DetTransformersPredictor):
         self,
         batch_data: List[Any],
         threshold: Optional[Union[float, dict]] = None,
-        layout_nms: bool = False,
+        layout_nms: Optional[bool] = None,
         layout_unclip_ratio: Optional[Union[float, Tuple[float, float], dict]] = None,
         layout_merge_bboxes_mode: Optional[Union[str, dict]] = None,
         layout_shape_mode: Optional[str] = "auto",
@@ -476,7 +476,7 @@ class LayoutAnalysisTransformersPredictor(DetTransformersPredictor):
             batch_outputs,
             datas,
             threshold=effective_threshold,
-            layout_nms=layout_nms or self.layout_nms,
+            layout_nms=self.layout_nms if layout_nms is None else layout_nms,
             layout_unclip_ratio=layout_unclip_ratio or self.layout_unclip_ratio,
             layout_merge_bboxes_mode=layout_merge_bboxes_mode
             or self.layout_merge_bboxes_mode,
