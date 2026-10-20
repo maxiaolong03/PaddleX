@@ -151,7 +151,7 @@ class InferRequest(OutputFormatsMixin, ocr.BaseInferRequest):
                     raise ValueError(
                         f"`layoutUnclipRatio`{context} must be > 0; got: {value}"
                     )
-            elif isinstance(value, list):
+            elif isinstance(value, (list, tuple)):
                 if len(value) != 2:
                     raise ValueError(
                         f"`layoutUnclipRatio`{context} must be two numbers; got: {len(value)} values"
