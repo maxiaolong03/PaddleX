@@ -188,6 +188,7 @@ for res in output:
 <li><b>字典</b>，key为<b>int</b>类型的<code>cls_id</code>，value为<b>tuple</b>，如 <code>{0: (1.1, 2.0)}</code></li>
 <li><b>None</b>，不指定，将默认使用PaddleX官方模型配置</li>
 </ul>
+对于 PP-DocLayoutV4，四边形边界也会以检测框中心为中心，沿原图横、纵轴同步缩放；缩放后的边界用于普通裁图和几何矫正裁图。
 </td>
 <td>None</td>
 </tr>

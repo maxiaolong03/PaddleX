@@ -185,6 +185,7 @@ Relevant methods, parameters, and explanations are as follows:
 <li><b>dict</b>, keys as <b>int</b> representing <code>cls_id</code>, values as <b>tuple</b>, e.g., <code>{0: (1.1, 2.0)}</code></li>
 <li><b>None</b>, not specified, will use the default PaddleX official model configuration</li>
 </ul>
+For PP-DocLayoutV4, the quadrilateral boundary is also scaled about the detection box center along the original image's horizontal and vertical axes. The scaled boundary is used for both ordinary and geometrically corrected crops.
 </td>
 <td>None</td>
 </tr>

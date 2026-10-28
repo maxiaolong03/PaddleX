@@ -505,6 +505,30 @@ def unclip_boxes(boxes, unclip_ratio=None):
         return expanded_boxes
 
 
+def _unclip_quads(quad, boxes, unclip_ratio):
+    """Scale quads about the same AABB centers as ``unclip_boxes``.
+
+    Ratios are in the original page's x/y axes, normalized to a pair or a
+    per-class dictionary by ``LayoutAnalysisProcess.apply``. Scale the actual
+    crop boundary as well as its enclosing rectangle, so masking and page
+    rectification retain the added pixels. Keep out-of-page corners intact:
+    clipping them would distort the quad used by the rectifier.
+    """
+    if isinstance(unclip_ratio, dict):
+        ratios = np.asarray(
+            [unclip_ratio.get(int(class_id), (1.0, 1.0)) for class_id in boxes[:, 0]]
+        )
+    else:
+        ratios = np.broadcast_to(unclip_ratio, (len(boxes), 2))
+    centers = boxes[:, 2:4] + (boxes[:, 4:6] - boxes[:, 2:4]) / 2
+    points = quad.reshape(-1, 4, 2)
+    # Add only the displacement: identity ratios preserve fractional coordinates
+    # exactly, and the model's output array is never modified in place.
+    return (
+        points + (points - centers[:, None, :]) * (ratios[:, None, :] - 1.0)
+    ).reshape(-1, 8)
+
+
 def make_valid(poly):
     if not poly.is_valid:
         poly = poly.buffer(0)
@@ -1011,6 +1035,7 @@ class LayoutAnalysisProcess:
         rel_logits: Optional[ndarray] = None,
         roor_logits: Optional[ndarray] = None,
         qi: Optional[ndarray] = None,
+        polygon_points: Optional[List[ndarray]] = None,
     ) -> Boxes:
         """Apply post-processing to the detection boxes.
 
@@ -1018,6 +1043,8 @@ class LayoutAnalysisProcess:
             boxes (ndarray): The input detection boxes with scores.
             img_size (tuple): The original image size.
             quad (ndarray, optional): Quad coordinates [N, 8] for 4-point box models.
+            polygon_points (List[ndarray], optional): Per-box polygons supplied by
+                Transformers mask models; vertex counts may differ between boxes.
 
         Returns:
             Boxes: The post-processed detection boxes.
@@ -1025,6 +1052,7 @@ class LayoutAnalysisProcess:
         if layout_shape_mode == "rect":
             masks = None
             quad = None
+            polygon_points = None
         has_order_logits = (
             rel_logits is not None and roor_logits is not None and qi is not None
         )
@@ -1036,6 +1064,10 @@ class LayoutAnalysisProcess:
                 masks = masks[expect_boxes, ...]
             if quad is not None:
                 quad = quad[expect_boxes]
+            if polygon_points is not None:
+                polygon_points = [
+                    polygon_points[i] for i, keep in enumerate(expect_boxes) if keep
+                ]
             if has_order_logits:
                 qi = qi[expect_boxes]
         elif isinstance(threshold, dict):
@@ -1044,6 +1076,8 @@ class LayoutAnalysisProcess:
                 category_filtered_masks = []
             if quad is not None:
                 category_filtered_quad = []
+            if polygon_points is not None:
+                category_filtered_polygon_points = []
             if has_order_logits:
                 category_filtered_qi = []
             for cat_id in np.unique(boxes[:, 0]):
@@ -1064,13 +1098,18 @@ class LayoutAnalysisProcess:
                     category_filtered_masks.append(category_masks)
                 if quad is not None:
                     category_filtered_quad.append(category_quad[selected_indices])
+                if polygon_points is not None:
+                    category_filtered_polygon_points.extend(
+                        polygon_points[i]
+                        for i in np.flatnonzero(cat_mask)[selected_indices]
+                    )
                 if has_order_logits:
                     category_filtered_qi.append(category_qi[selected_indices])
                 category_filtered_boxes.append(category_boxes[selected_indices])
             boxes = (
                 np.vstack(category_filtered_boxes)
                 if category_filtered_boxes
-                else np.array([])
+                else boxes[:0]
             )
             if masks is not None:
                 masks = (
@@ -1084,6 +1123,8 @@ class LayoutAnalysisProcess:
                     if category_filtered_quad
                     else np.array([]).reshape(0, 8)
                 )
+            if polygon_points is not None:
+                polygon_points = category_filtered_polygon_points
             if has_order_logits:
                 qi = (
                     np.concatenate(category_filtered_qi)
@@ -1108,6 +1149,8 @@ class LayoutAnalysisProcess:
                 masks = [masks[i] for i in selected_indices]
             if quad is not None:
                 quad = quad[selected_indices]
+            if polygon_points is not None:
+                polygon_points = [polygon_points[i] for i in selected_indices]
 
         filter_large_image = True
         # boxes.shape[1] == 6 is object detection, 7 is new ordered object detection, 8 is ordered object detection
@@ -1121,6 +1164,7 @@ class LayoutAnalysisProcess:
             filtered_boxes = []
             filtered_masks = []
             filtered_quad = []
+            filtered_polygon_points = []
             for idx, box in enumerate(boxes):
                 (
                     label_index,
@@ -1145,23 +1189,31 @@ class LayoutAnalysisProcess:
                             filtered_masks.append(masks[idx])
                         if quad is not None:
                             filtered_quad.append(quad[idx])
+                        if polygon_points is not None:
+                            filtered_polygon_points.append(polygon_points[idx])
                 else:
                     filtered_boxes.append(box)
                     if masks is not None:
                         filtered_masks.append(masks[idx])
                     if quad is not None:
                         filtered_quad.append(quad[idx])
+                    if polygon_points is not None:
+                        filtered_polygon_points.append(polygon_points[idx])
             if len(filtered_boxes) == 0:
                 filtered_boxes = boxes
                 if masks is not None:
                     filtered_masks = masks
                 if quad is not None:
                     filtered_quad = list(quad)
+                if polygon_points is not None:
+                    filtered_polygon_points = polygon_points
             boxes = np.array(filtered_boxes)
             if masks is not None:
                 masks = filtered_masks
             if quad is not None:
                 quad = np.array(filtered_quad)
+            if polygon_points is not None:
+                polygon_points = filtered_polygon_points
 
         if layout_merge_bboxes_mode:
             formula_index = (
@@ -1194,6 +1246,10 @@ class LayoutAnalysisProcess:
                             ]
                         if quad is not None:
                             quad = quad[keep_mask]
+                        if polygon_points is not None:
+                            polygon_points = [
+                                p for p, keep in zip(polygon_points, keep_mask) if keep
+                            ]
                     elif layout_merge_bboxes_mode == "small":
                         keep_mask = (contains_other == 0) | (contained_by_other == 1)
                         boxes = boxes[keep_mask]
@@ -1203,6 +1259,10 @@ class LayoutAnalysisProcess:
                             ]
                         if quad is not None:
                             quad = quad[keep_mask]
+                        if polygon_points is not None:
+                            polygon_points = [
+                                p for p, keep in zip(polygon_points, keep_mask) if keep
+                            ]
             elif isinstance(layout_merge_bboxes_mode, dict):
                 keep_mask = np.ones(len(boxes), dtype=bool)
                 for category_index, layout_mode in layout_merge_bboxes_mode.items():
@@ -1261,6 +1321,10 @@ class LayoutAnalysisProcess:
                     masks = [mask for i, mask in enumerate(masks) if keep_mask[i]]
                 if quad is not None:
                     quad = quad[keep_mask]
+                if polygon_points is not None:
+                    polygon_points = [
+                        p for p, keep in zip(polygon_points, keep_mask) if keep
+                    ]
 
         if boxes.size == 0:
             return np.array([])
@@ -1275,6 +1339,8 @@ class LayoutAnalysisProcess:
                 masks = sorted_masks
             if quad is not None:
                 quad = quad[sorted_idx]
+            if polygon_points is not None:
+                polygon_points = [polygon_points[i] for i in sorted_idx]
 
         if boxes.shape[1] == 7:
             # Sort boxes by their order
@@ -1286,19 +1352,18 @@ class LayoutAnalysisProcess:
                 masks = sorted_masks
             if quad is not None:
                 quad = quad[sorted_idx]
+            if polygon_points is not None:
+                polygon_points = [polygon_points[i] for i in sorted_idx]
 
-        polygon_points = None
-        if masks is not None:
+        if polygon_points is None and masks is not None:
             scale_ratio = [h / s for h, s in zip(self.scale_size, img_size)]
             polygon_points = extract_polygon_points_by_masks(
                 boxes, np.array(masks), scale_ratio, layout_shape_mode, quad=quad
             )
-        # elif quad is not None:
-        #     # No masks and no polygon_points, but we have model-predicted quads
-        #     polygon_points = [quad[i].reshape(4, 2) for i in range(len(quad))]
-        #     polygon_points = normalize_polygon_points_by_boxes(
-        #         boxes, polygon_points, layout_shape_mode, quad=quad
-        #     )
+        elif polygon_points is not None:
+            polygon_points = normalize_polygon_points_by_boxes(
+                boxes, polygon_points, layout_shape_mode, quad=quad
+            )
 
         if layout_unclip_ratio:
             if isinstance(layout_unclip_ratio, float):
@@ -1313,6 +1378,8 @@ class LayoutAnalysisProcess:
                 raise ValueError(
                     f"The type of `layout_unclip_ratio` must be float, Tuple[float, float] or  Dict[int, Tuple[float, float]], but got {type(layout_unclip_ratio)}."
                 )
+            if quad is not None:
+                quad = _unclip_quads(quad, boxes, layout_unclip_ratio)
             boxes = unclip_boxes(boxes, layout_unclip_ratio)
 
         if boxes.shape[1] == 6:
@@ -1353,7 +1420,10 @@ class LayoutAnalysisProcess:
             current_layout_shape_mode = layout_shape_mode
             masks = output.get("masks", None)
             quad = output.get("quad", None)
-            if masks is None and quad is None:
+            # Paddle mask models supply masks; Transformers supplies decoded
+            # polygons instead. Keep V4's independent quad path in both cases.
+            polygon_points = output.get("polygon_points") if masks is None else None
+            if masks is None and quad is None and polygon_points is None:
                 current_layout_shape_mode = "rect"
                 if idx == 0 and layout_shape_mode not in ["rect", "auto"]:
                     logging.warning(
@@ -1373,6 +1443,7 @@ class LayoutAnalysisProcess:
                 rel_logits=output.get("rel_logits", None),
                 roor_logits=output.get("roor_logits", None),
                 qi=output.get("qi", None),
+                polygon_points=polygon_points,
             )
             if filter_overlap_boxes:
                 boxes = filter_boxes(boxes, current_layout_shape_mode)
