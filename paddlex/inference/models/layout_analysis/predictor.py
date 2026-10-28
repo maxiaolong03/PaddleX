@@ -431,6 +431,11 @@ class LayoutAnalysisTransformersPredictor(DetTransformersPredictor):
                 # V4 predicts quads in original-image coordinates. Keep them in
                 # the same filtering/sorting path as the Paddle engine outputs.
                 points = points.detach().cpu().numpy()
+            if len(points) != len(formatted):
+                raise ValueError(
+                    f"polygon_points count ({len(points)}) must match boxes count ({len(formatted)})"
+                )
+            if self.model_name == "PP-DocLayoutV4":
                 output["quad"] = points.reshape(len(formatted), 8)
             else:
                 output["polygon_points"] = [np.asarray(p) for p in points]

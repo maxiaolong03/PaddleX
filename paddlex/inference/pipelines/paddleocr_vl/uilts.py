@@ -24,7 +24,11 @@ import numpy as np
 from PIL import Image
 from pydantic import BaseModel, computed_field, model_validator
 
-from ...models.layout_analysis.processors import quad_area, quad_overlap_ratio
+from ...models.layout_analysis.processors import (
+    get_layout_filter_geometry,
+    quad_area,
+    quad_overlap_ratio,
+)
 from ..layout_parsing.utils import (
     calculate_overlap_ratio,
     calculate_projection_overlap_ratio,
@@ -126,7 +130,8 @@ def filter_overlap_boxes(
         layout_det_res_filtered["boxes"] = boxes
         return layout_det_res_filtered
 
-    coords = np.array([box["coordinate"] for box in boxes], dtype=np.float64)
+    geometry = [get_layout_filter_geometry(box) for box in boxes]
+    coords = np.array([box["coordinate"] for box in geometry], dtype=np.float64)
     widths = coords[:, 2] - coords[:, 0]
     heights = coords[:, 3] - coords[:, 1]
     overlap_matrix, areas = _compute_pairwise_overlap_small(coords)
@@ -139,10 +144,10 @@ def filter_overlap_boxes(
             if i in dropped_indexes or j in dropped_indexes:
                 continue
             # Use quad polygon overlap if both boxes have quad
-            if "quad" in boxes[i] and "quad" in boxes[j]:
+            if "quad" in geometry[i] and "quad" in geometry[j]:
                 overlap_ratio = quad_overlap_ratio(
-                    np.array(boxes[i]["quad"]).flatten(),
-                    np.array(boxes[j]["quad"]).flatten(),
+                    np.array(geometry[i]["quad"]).flatten(),
+                    np.array(geometry[j]["quad"]).flatten(),
                     "small",
                 )
             else:
@@ -158,9 +163,11 @@ def filter_overlap_boxes(
                         dropped_indexes.add(j)
                     continue
             if overlap_ratio > 0.7:
-                if layout_shape_mode != "rect" and "polygon_points" in boxes[i]:
+                if layout_shape_mode != "rect" and "polygon_points" in geometry[i]:
                     poly_overlap_ratio = calculate_polygon_overlap_ratio(
-                        boxes[i]["polygon_points"], boxes[j]["polygon_points"], "small"
+                        geometry[i]["polygon_points"],
+                        geometry[j]["polygon_points"],
+                        "small",
                     )
                     if poly_overlap_ratio < 0.7:
                         continue
@@ -174,12 +181,12 @@ def filter_overlap_boxes(
                     }:
                         continue
                 # Use quad area if available
-                if "quad" in boxes[i]:
-                    area_i = quad_area(np.array(boxes[i]["quad"]).flatten())
+                if "quad" in geometry[i]:
+                    area_i = quad_area(np.array(geometry[i]["quad"]).flatten())
                 else:
                     area_i = areas[i]
-                if "quad" in boxes[j]:
-                    area_j = quad_area(np.array(boxes[j]["quad"]).flatten())
+                if "quad" in geometry[j]:
+                    area_j = quad_area(np.array(geometry[j]["quad"]).flatten())
                 else:
                     area_j = areas[j]
                 if area_i >= area_j:
@@ -581,8 +588,9 @@ def tokenize_figure_of_table(table_block_img, table_box, figures, crop_matrix=No
                 figure_y_max - table_y_min,
             ]
             if crop_matrix is not None:
-                draw_box = _box_through(crop_matrix, figure["coordinate"],
-                                        table_block_img.shape)
+                draw_box = _box_through(
+                    crop_matrix, figure["coordinate"], table_block_img.shape
+                )
                 if draw_box is None:
                     continue
             token_str = "[F" + str(random_map[figure_id]) + "]"
@@ -596,7 +604,9 @@ def tokenize_figure_of_table(table_block_img, table_box, figures, crop_matrix=No
 def _box_through(matrix, box, img_shape):
     """Axis-aligned box of `box`'s corners mapped by `matrix`, clipped to the image."""
     x1, y1, x2, y2 = [float(v) for v in box]
-    pts = np.array([[x1, y1, 1], [x2, y1, 1], [x2, y2, 1], [x1, y2, 1]], dtype=np.float64)
+    pts = np.array(
+        [[x1, y1, 1], [x2, y1, 1], [x2, y2, 1], [x1, y2, 1]], dtype=np.float64
+    )
     p = pts @ np.asarray(matrix, dtype=np.float64).T
     p = p[:, :2] / p[:, 2:3]
     h, w = img_shape[:2]

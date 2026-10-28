@@ -182,10 +182,10 @@ Relevant methods, parameters, and explanations are as follows:
 <ul>
 <li><b>float</b>, a positive float number, e.g., 1.1, means expanding the width and height of the detection box by 1.1 times while keeping the center unchanged</li>
 <li><b>List</b>, e.g., [1.2, 1.5], means expanding the width by 1.2 times and the height by 1.5 times while keeping the center unchanged</li>
-<li><b>dict</b>, keys as <b>int</b> representing <code>cls_id</code>, values as <b>tuple</b>, e.g., <code>{0: (1.1, 2.0)}</code></li>
+<li><b>dict</b>, keys are <b>int</b> values representing <code>cls_id</code>; values may be positive scalars or horizontal/vertical ratio lists or tuples, e.g., <code>{0: (1.1, 2.0), 1: 1.2}</code>. Unspecified classes keep their original size</li>
 <li><b>None</b>, not specified, will use the default PaddleX official model configuration</li>
 </ul>
-For PP-DocLayoutV4, the quadrilateral boundary is also scaled about the detection box center along the original image's horizontal and vertical axes. The scaled boundary is used for both ordinary and geometrically corrected crops.
+Boxes, quadrilaterals and polygons share the original floating-point box center and scale along the original image's horizontal and vertical axes. This includes PP-DocLayoutV3 Transformers polygons and Paddle models that output both masks and quads. The scaled boundaries are used for ordinary crops, 90-degree rotation and full geometric correction. Final rectangular crop bounds are rounded outwards and clipped to the image; a ratio of 1 preserves floating-point boundaries. NMS, containment and overlap filters always use the geometry before expansion, so the expansion ratio does not change their decisions.
 </td>
 <td>None</td>
 </tr>

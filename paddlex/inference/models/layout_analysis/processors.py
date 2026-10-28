@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from numbers import Real
 from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -28,6 +29,27 @@ if is_dep_available("opencv-contrib-python"):
 
 Boxes = List[dict]
 Number = Union[int, float]
+
+
+class _LayoutBox(dict):
+    """Export crop geometry, retaining detection geometry only in memory.
+
+    Both overlap filters run after model postprocessing, including in pipelines
+    that deepcopy results. A dict attribute preserves their original geometry
+    without adding fields to serialized model/pipeline output.
+    """
+
+    def __init__(self, data, filter_geometry):
+        super().__init__(data)
+        self._filter_geometry = filter_geometry
+
+    def copy(self):
+        return type(self)(self, self._filter_geometry)
+
+
+def get_layout_filter_geometry(box):
+    """Original detection geometry for filtering, or a plain caller's box."""
+    return getattr(box, "_filter_geometry", box)
 
 
 SKIP_ORDER_LABELS = [
@@ -294,10 +316,10 @@ def normalize_polygon_points_by_boxes(
 
 
 def _rect_from_box(box):
-    x_min, y_min, x_max, y_max = np.asarray(box).astype(np.int32)
+    x_min, y_min, x_max, y_max = np.asarray(box, dtype=np.float64)
     return np.array(
         [[x_min, y_min], [x_max, y_min], [x_max, y_max], [x_min, y_max]],
-        dtype=np.float32,
+        dtype=np.float64,
     )
 
 
@@ -314,7 +336,7 @@ def _normalize_layout_polygon(
         return rect
 
     if polygon is not None:
-        polygon = np.asarray(polygon, dtype=np.float32)
+        polygon = np.asarray(polygon, dtype=np.float64)
         if polygon.ndim == 1:
             polygon = polygon.reshape(-1, 2)
 
@@ -404,6 +426,7 @@ def restructured_boxes(
     img_size: Tuple[int, int],
     polygon_points: ndarray = None,
     quad: ndarray = None,
+    filter_geometry: Optional[List[dict]] = None,
 ) -> Boxes:
     """
     Restructure the given bounding boxes and labels based on the image size.
@@ -422,10 +445,12 @@ def restructured_boxes(
 
     for idx, box in enumerate(boxes):
         xmin, ymin, xmax, ymax = box[2:]
-        xmin = int(max(0, xmin))
-        ymin = int(max(0, ymin))
-        xmax = int(min(w, xmax))
-        ymax = int(min(h, ymax))
+        # Quantize only the final crop bounds, outwards so fractional geometry
+        # cannot be cut off by the axis-aligned crop.
+        xmin = int(np.floor(np.clip(xmin, 0, w)))
+        ymin = int(np.floor(np.clip(ymin, 0, h)))
+        xmax = int(np.ceil(np.clip(xmax, 0, w)))
+        ymax = int(np.ceil(np.clip(ymax, 0, h)))
         if xmax <= xmin or ymax <= ymin:
             continue
         res = {
@@ -442,91 +467,68 @@ def restructured_boxes(
             res["polygon_points"] = polygon_point
         if quad is not None:
             res["quad"] = quad[idx].reshape(4, 2).tolist()
+        if filter_geometry is not None:
+            res = _LayoutBox(res, filter_geometry[idx])
         box_list.append(res)
 
     return box_list
 
 
-def unclip_boxes(boxes, unclip_ratio=None):
-    """
-    Expand bounding boxes from (x1, y1, x2, y2) format using an unclipping ratio.
+def _resolve_unclip_ratios(class_ids, unclip_ratio):
+    """Resolve scalar, x/y pair or per-class ratios once for all crop shapes."""
 
-    Parameters:
-    - boxes: np.ndarray of shape (N, 4), where each row is (x1, y1, x2, y2).
-    - unclip_ratio: tuple of (width_ratio, height_ratio), optional.
+    def pair(value):
+        values = np.asarray(value, dtype=np.float64)
+        if values.ndim == 0:
+            values = np.repeat(values, 2)
+        if values.shape != (2,) or not np.all(np.isfinite(values) & (values > 0)):
+            raise ValueError(
+                "layout_unclip_ratio must contain positive finite x/y ratios"
+            )
+        return values
 
-    Returns:
-    - expanded_boxes: np.ndarray of shape (N, 4), where each row is (x1, y1, x2, y2).
-    """
     if unclip_ratio is None:
-        return boxes
-
+        return np.ones((len(class_ids), 2), dtype=np.float64)
     if isinstance(unclip_ratio, dict):
-        expanded_boxes = []
-        for box in boxes:
-            class_id, score, x1, y1, x2, y2 = box
-            if class_id in unclip_ratio:
-                width_ratio, height_ratio = unclip_ratio[class_id]
-
-                width = x2 - x1
-                height = y2 - y1
-
-                new_w = width * width_ratio
-                new_h = height * height_ratio
-                center_x = x1 + width / 2
-                center_y = y1 + height / 2
-
-                new_x1 = center_x - new_w / 2
-                new_y1 = center_y - new_h / 2
-                new_x2 = center_x + new_w / 2
-                new_y2 = center_y + new_h / 2
-
-                expanded_boxes.append([class_id, score, new_x1, new_y1, new_x2, new_y2])
-            else:
-                expanded_boxes.append(box)
-        return np.array(expanded_boxes)
-
-    else:
-        widths = boxes[:, 4] - boxes[:, 2]
-        heights = boxes[:, 5] - boxes[:, 3]
-
-        new_w = widths * unclip_ratio[0]
-        new_h = heights * unclip_ratio[1]
-        center_x = boxes[:, 2] + widths / 2
-        center_y = boxes[:, 3] + heights / 2
-
-        new_x1 = center_x - new_w / 2
-        new_y1 = center_y - new_h / 2
-        new_x2 = center_x + new_w / 2
-        new_y2 = center_y + new_h / 2
-        expanded_boxes = np.column_stack(
-            (boxes[:, 0], boxes[:, 1], new_x1, new_y1, new_x2, new_y2)
-        )
-        return expanded_boxes
+        normalized = {key: pair(value) for key, value in unclip_ratio.items()}
+        return np.asarray(
+            [normalized.get(int(class_id), (1.0, 1.0)) for class_id in class_ids],
+            dtype=np.float64,
+        ).reshape(-1, 2)
+    return np.broadcast_to(pair(unclip_ratio), (len(class_ids), 2))
 
 
-def _unclip_quads(quad, boxes, unclip_ratio):
-    """Scale quads about the same AABB centers as ``unclip_boxes``.
+def _scale_points(points, centers, ratios):
+    """Apply one page-axis affine transform, preserving identity coordinates."""
+    points = np.asarray(points, dtype=np.float64)
+    return points + (points - centers) * (ratios - 1.0)
 
-    Ratios are in the original page's x/y axes, normalized to a pair or a
-    per-class dictionary by ``LayoutAnalysisProcess.apply``. Scale the actual
-    crop boundary as well as its enclosing rectangle, so masking and page
-    rectification retain the added pixels. Keep out-of-page corners intact:
-    clipping them would distort the quad used by the rectifier.
-    """
-    if isinstance(unclip_ratio, dict):
-        ratios = np.asarray(
-            [unclip_ratio.get(int(class_id), (1.0, 1.0)) for class_id in boxes[:, 0]]
-        )
-    else:
-        ratios = np.broadcast_to(unclip_ratio, (len(boxes), 2))
+
+def _scale_boxes(boxes, centers, ratios):
+    scaled = np.array(boxes, dtype=np.float64, copy=True)
+    scaled[:, 2:6] = _scale_points(
+        scaled[:, 2:6].reshape(-1, 2, 2), centers[:, None, :], ratios[:, None, :]
+    ).reshape(-1, 4)
+    return scaled
+
+
+def unclip_boxes(boxes, unclip_ratio=None):
+    """Scale [class, score, xmin, ymin, xmax, ymax, ...] without quantization."""
+    boxes = np.asarray(boxes, dtype=np.float64)
     centers = boxes[:, 2:4] + (boxes[:, 4:6] - boxes[:, 2:4]) / 2
-    points = quad.reshape(-1, 4, 2)
-    # Add only the displacement: identity ratios preserve fractional coordinates
-    # exactly, and the model's output array is never modified in place.
-    return (
-        points + (points - centers[:, None, :]) * (ratios[:, None, :] - 1.0)
-    ).reshape(-1, 8)
+    return _scale_boxes(
+        boxes, centers, _resolve_unclip_ratios(boxes[:, 0], unclip_ratio)
+    )
+
+
+def _validate_geometry_counts(boxes, **geometry):
+    if boxes.ndim != 2 or boxes.shape[1] not in (6, 7, 8):
+        raise ValueError(f"Expected boxes with shape [N, 6/7/8], got {boxes.shape}")
+    for name, values in geometry.items():
+        if values is not None and len(values) != len(boxes):
+            raise ValueError(
+                f"{name} count ({len(values)}) must match boxes count ({len(boxes)})"
+            )
 
 
 def make_valid(poly):
@@ -869,6 +871,7 @@ def filter_boxes(
         Dict[str, List[Dict]]: Filtered dict with overlapping boxes removed.
     """
     boxes = [box for box in src_boxes if box["label"] != "reference"]
+    geometry = [get_layout_filter_geometry(box) for box in boxes]
     dropped_indexes = set()
 
     # Precompute quad polygons/areas/AABBs once (instead of rebuilding two
@@ -877,12 +880,12 @@ def filter_boxes(
     _qpoly = [None] * n_boxes
     _qarea = [0.0] * n_boxes
     _qaabb = [None] * n_boxes
-    if any("quad" in box for box in boxes):
+    if any("quad" in box for box in geometry):
         from shapely.geometry import Polygon as ShapelyPolygon
 
         for k in range(n_boxes):
-            if "quad" in boxes[k]:
-                pts = np.array(boxes[k]["quad"], dtype=np.float64).reshape(4, 2)
+            if "quad" in geometry[k]:
+                pts = np.array(geometry[k]["quad"], dtype=np.float64).reshape(4, 2)
                 p = ShapelyPolygon(pts)
                 if not p.is_valid:
                     p = p.buffer(0)
@@ -896,7 +899,7 @@ def filter_boxes(
                 )
 
     for i in range(len(boxes)):
-        x1, y1, x2, y2 = boxes[i]["coordinate"]
+        x1, y1, x2, y2 = geometry[i]["coordinate"]
         w, h = x2 - x1, y2 - y1
         if w < 6 or h < 6:
             dropped_indexes.add(i)
@@ -904,7 +907,7 @@ def filter_boxes(
             if i in dropped_indexes or j in dropped_indexes:
                 continue
             # Use quad overlap if both boxes have quad
-            if "quad" in boxes[i] and "quad" in boxes[j]:
+            if "quad" in geometry[i] and "quad" in geometry[j]:
                 # AABB pre-filter: disjoint AABBs => overlap ratio is exactly 0.
                 if _aabb_disjoint(_qaabb[i], _qaabb[j]):
                     overlap_ratio = 0.0
@@ -914,7 +917,7 @@ def filter_boxes(
                     overlap_ratio = inter / ref if ref > 0 else 0.0
             else:
                 overlap_ratio = calculate_overlap_ratio(
-                    boxes[i]["coordinate"], boxes[j]["coordinate"], "small"
+                    geometry[i]["coordinate"], geometry[j]["coordinate"], "small"
                 )
             if (
                 boxes[i]["label"] == "inline_formula"
@@ -927,21 +930,23 @@ def filter_boxes(
                         dropped_indexes.add(j)
                     continue
             if overlap_ratio > 0.7:
-                if layout_shape_mode != "rect" and "polygon_points" in boxes[i]:
+                if layout_shape_mode != "rect" and "polygon_points" in geometry[i]:
                     poly_overlap_ratio = calculate_polygon_overlap_ratio(
-                        boxes[i]["polygon_points"], boxes[j]["polygon_points"], "small"
+                        geometry[i]["polygon_points"],
+                        geometry[j]["polygon_points"],
+                        "small",
                     )
                     if poly_overlap_ratio < 0.7:
                         continue
                 # Use quad area if available
-                if "quad" in boxes[i]:
-                    box_area_i = quad_area(np.array(boxes[i]["quad"]).flatten())
+                if "quad" in geometry[i]:
+                    box_area_i = quad_area(np.array(geometry[i]["quad"]).flatten())
                 else:
-                    box_area_i = calculate_bbox_area(boxes[i]["coordinate"])
-                if "quad" in boxes[j]:
-                    box_area_j = quad_area(np.array(boxes[j]["quad"]).flatten())
+                    box_area_i = calculate_bbox_area(geometry[i]["coordinate"])
+                if "quad" in geometry[j]:
+                    box_area_j = quad_area(np.array(geometry[j]["quad"]).flatten())
                 else:
-                    box_area_j = calculate_bbox_area(boxes[j]["coordinate"])
+                    box_area_j = calculate_bbox_area(geometry[j]["coordinate"])
                 labels = {boxes[i]["label"], boxes[j]["label"]}
                 if labels & {"image", "table", "seal", "chart"} and len(labels) > 1:
                     if "table" not in labels or labels <= {
@@ -1037,362 +1042,192 @@ class LayoutAnalysisProcess:
         qi: Optional[ndarray] = None,
         polygon_points: Optional[List[ndarray]] = None,
     ) -> Boxes:
-        """Apply post-processing to the detection boxes.
+        """Filter original detections by index, then scale all crop geometry.
 
-        Args:
-            boxes (ndarray): The input detection boxes with scores.
-            img_size (tuple): The original image size.
-            quad (ndarray, optional): Quad coordinates [N, 8] for 4-point box models.
-            polygon_points (List[ndarray], optional): Per-box polygons supplied by
-                Transformers mask models; vertex counts may differ between boxes.
-
-        Returns:
-            Boxes: The post-processed detection boxes.
+        Keep source arrays and floating-point coordinates intact. Only the
+        retained indices change during filtering/sorting; gather masks, quads
+        and variable-length polygons together after the final ordering.
         """
-        if layout_shape_mode == "rect":
-            masks = None
-            quad = None
-            polygon_points = None
-        has_order_logits = (
-            rel_logits is not None and roor_logits is not None and qi is not None
+        boxes = np.asarray(boxes, dtype=np.float64)
+        _validate_geometry_counts(
+            boxes, masks=masks, quad=quad, polygon_points=polygon_points, qi=qi
         )
-        boxes[:, 2:6] = np.round(boxes[:, 2:6]).astype(int)
-        if isinstance(threshold, float):
-            expect_boxes = (boxes[:, 1] > threshold) & (boxes[:, 0] > -1)
-            boxes = boxes[expect_boxes, :]
-            if masks is not None:
-                masks = masks[expect_boxes, ...]
-            if quad is not None:
-                quad = quad[expect_boxes]
-            if polygon_points is not None:
-                polygon_points = [
-                    polygon_points[i] for i, keep in enumerate(expect_boxes) if keep
-                ]
-            if has_order_logits:
-                qi = qi[expect_boxes]
-        elif isinstance(threshold, dict):
-            category_filtered_boxes = []
-            if masks is not None:
-                category_filtered_masks = []
-            if quad is not None:
-                category_filtered_quad = []
-            if polygon_points is not None:
-                category_filtered_polygon_points = []
-            if has_order_logits:
-                category_filtered_qi = []
-            for cat_id in np.unique(boxes[:, 0]):
-                cat_mask = boxes[:, 0] == cat_id
-                category_boxes = boxes[cat_mask]
-                if masks is not None:
-                    category_masks = masks[cat_mask]
-                if quad is not None:
-                    category_quad = quad[cat_mask]
-                if has_order_logits:
-                    category_qi = qi[cat_mask]
-                category_threshold = threshold.get(int(cat_id), 0.5)
-                selected_indices = (category_boxes[:, 1] > category_threshold) & (
-                    category_boxes[:, 0] > -1
-                )
-                if masks is not None:
-                    category_masks = category_masks[selected_indices]
-                    category_filtered_masks.append(category_masks)
-                if quad is not None:
-                    category_filtered_quad.append(category_quad[selected_indices])
-                if polygon_points is not None:
-                    category_filtered_polygon_points.extend(
-                        polygon_points[i]
-                        for i in np.flatnonzero(cat_mask)[selected_indices]
-                    )
-                if has_order_logits:
-                    category_filtered_qi.append(category_qi[selected_indices])
-                category_filtered_boxes.append(category_boxes[selected_indices])
-            boxes = (
-                np.vstack(category_filtered_boxes)
-                if category_filtered_boxes
-                else boxes[:0]
-            )
-            if masks is not None:
-                masks = (
-                    np.concatenate(category_filtered_masks)
-                    if category_filtered_masks
-                    else np.array([])
-                )
-            if quad is not None:
-                quad = (
-                    np.vstack(category_filtered_quad)
-                    if category_filtered_quad
-                    else np.array([]).reshape(0, 8)
-                )
-            if polygon_points is not None:
-                polygon_points = category_filtered_polygon_points
-            if has_order_logits:
-                qi = (
-                    np.concatenate(category_filtered_qi)
-                    if category_filtered_qi
-                    else np.array([], dtype=np.int64)
-                )
+        ratios = _resolve_unclip_ratios(boxes[:, 0], layout_unclip_ratio)
+        if layout_shape_mode == "rect":
+            masks = quad = polygon_points = None
+        elif masks is not None:
+            # Preserve Paddle's mask precedence over decoded Transformers polygons.
+            polygon_points = None
+        if quad is not None:
+            quad = np.asarray(quad, dtype=np.float64).reshape(len(boxes), 8)
+        if masks is not None:
+            masks = np.asarray(masks)
+        if qi is not None:
+            qi = np.asarray(qi)
 
-        # Compute reading order right after threshold filtering
-        if has_order_logits and len(boxes) > 0:
-            order = compute_reading_order(boxes, rel_logits, roor_logits, qi)
-            boxes = np.concatenate(
-                [boxes, order.reshape(-1, 1).astype(np.float32)], axis=1
+        indices = np.arange(len(boxes))
+        if isinstance(threshold, Real):
+            indices = indices[(boxes[:, 1] > threshold) & (boxes[:, 0] > -1)]
+        elif isinstance(threshold, dict):
+            groups = [
+                np.flatnonzero(
+                    (boxes[:, 0] == cat_id)
+                    & (boxes[:, 1] > threshold.get(int(cat_id), 0.5))
+                    & (boxes[:, 0] > -1)
+                )
+                for cat_id in np.unique(boxes[:, 0])
+            ]
+            indices = np.concatenate(groups) if groups else indices[:0]
+        if not len(indices):
+            return []
+
+        reading_order = None
+        if rel_logits is not None and roor_logits is not None and qi is not None:
+            reading_order = np.zeros(len(boxes), dtype=np.int64)
+            reading_order[indices] = compute_reading_order(
+                boxes[indices, :6], rel_logits, roor_logits, qi[indices]
             )
 
         if layout_nms:
             if quad is not None:
-                selected_indices = nms_quad(boxes, quad, iou_same=0.6, iou_diff=0.98)
+                keep = nms_quad(
+                    boxes[indices], quad[indices], iou_same=0.6, iou_diff=0.98
+                )
             else:
-                selected_indices = nms(boxes[:, :6], iou_same=0.6, iou_diff=0.98)
-            boxes = np.array(boxes[selected_indices])
-            if masks is not None:
-                masks = [masks[i] for i in selected_indices]
-            if quad is not None:
-                quad = quad[selected_indices]
-            if polygon_points is not None:
-                polygon_points = [polygon_points[i] for i in selected_indices]
+                keep = nms(boxes[indices, :6], iou_same=0.6, iou_diff=0.98)
+            indices = indices[keep]
 
-        filter_large_image = True
-        # boxes.shape[1] == 6 is object detection, 7 is new ordered object detection, 8 is ordered object detection
-        if filter_large_image and len(boxes) > 1 and boxes.shape[1] in [6, 7, 8]:
-            if img_size[0] > img_size[1]:
-                area_thres = 0.82
-            else:
-                area_thres = 0.93
-            image_index = self.labels.index("image") if "image" in self.labels else None
-            img_area = img_size[0] * img_size[1]
-            filtered_boxes = []
-            filtered_masks = []
-            filtered_quad = []
-            filtered_polygon_points = []
-            for idx, box in enumerate(boxes):
-                (
-                    label_index,
-                    score,
-                    xmin,
-                    ymin,
-                    xmax,
-                    ymax,
-                ) = box[:6]
-                if label_index == image_index:
-                    xmin = max(0, xmin)
-                    ymin = max(0, ymin)
-                    xmax = min(img_size[0], xmax)
-                    ymax = min(img_size[1], ymax)
-                    if quad is not None:
-                        box_area = quad_area(quad[idx])
-                    else:
-                        box_area = (xmax - xmin) * (ymax - ymin)
-                    if box_area <= area_thres * img_area:
-                        filtered_boxes.append(box)
-                        if masks is not None:
-                            filtered_masks.append(masks[idx])
-                        if quad is not None:
-                            filtered_quad.append(quad[idx])
-                        if polygon_points is not None:
-                            filtered_polygon_points.append(polygon_points[idx])
-                else:
-                    filtered_boxes.append(box)
-                    if masks is not None:
-                        filtered_masks.append(masks[idx])
-                    if quad is not None:
-                        filtered_quad.append(quad[idx])
-                    if polygon_points is not None:
-                        filtered_polygon_points.append(polygon_points[idx])
-            if len(filtered_boxes) == 0:
-                filtered_boxes = boxes
-                if masks is not None:
-                    filtered_masks = masks
+        if len(indices) > 1 and "image" in self.labels:
+            image_index = self.labels.index("image")
+            area_threshold = 0.82 if img_size[0] > img_size[1] else 0.93
+            keep = np.ones(len(indices), dtype=bool)
+            for position, source_index in enumerate(indices):
+                if boxes[source_index, 0] != image_index:
+                    continue
                 if quad is not None:
-                    filtered_quad = list(quad)
-                if polygon_points is not None:
-                    filtered_polygon_points = polygon_points
-            boxes = np.array(filtered_boxes)
-            if masks is not None:
-                masks = filtered_masks
-            if quad is not None:
-                quad = np.array(filtered_quad)
-            if polygon_points is not None:
-                polygon_points = filtered_polygon_points
+                    area = quad_area(quad[source_index])
+                else:
+                    xmin, ymin, xmax, ymax = boxes[source_index, 2:6]
+                    area = (min(img_size[0], xmax) - max(0, xmin)) * (
+                        min(img_size[1], ymax) - max(0, ymin)
+                    )
+                keep[position] = area <= area_threshold * img_size[0] * img_size[1]
+            # Match the existing fallback when every result is a large image.
+            if keep.any():
+                indices = indices[keep]
 
         if layout_merge_bboxes_mode:
             formula_index = (
                 self.labels.index("formula") if "formula" in self.labels else None
             )
-            if isinstance(layout_merge_bboxes_mode, str):
-                assert layout_merge_bboxes_mode in [
-                    "union",
-                    "large",
-                    "small",
-                ], f"The value of `layout_merge_bboxes_mode` must be one of ['union', 'large', 'small'], but got {layout_merge_bboxes_mode}"
-
-                if layout_merge_bboxes_mode == "union":
-                    pass
-                else:
-                    if quad is not None:
-                        contains_other, contained_by_other = check_containment_quad(
-                            quad, boxes[:, 0], formula_index
-                        )
-                    else:
-                        contains_other, contained_by_other = check_containment(
-                            boxes[:, :6], formula_index
-                        )
-                    if layout_merge_bboxes_mode == "large":
-                        keep_mask = contained_by_other == 0
-                        boxes = boxes[keep_mask]
-                        if masks is not None:
-                            masks = [
-                                mask for i, mask in enumerate(masks) if keep_mask[i]
-                            ]
-                        if quad is not None:
-                            quad = quad[keep_mask]
-                        if polygon_points is not None:
-                            polygon_points = [
-                                p for p, keep in zip(polygon_points, keep_mask) if keep
-                            ]
-                    elif layout_merge_bboxes_mode == "small":
-                        keep_mask = (contains_other == 0) | (contained_by_other == 1)
-                        boxes = boxes[keep_mask]
-                        if masks is not None:
-                            masks = [
-                                mask for i, mask in enumerate(masks) if keep_mask[i]
-                            ]
-                        if quad is not None:
-                            quad = quad[keep_mask]
-                        if polygon_points is not None:
-                            polygon_points = [
-                                p for p, keep in zip(polygon_points, keep_mask) if keep
-                            ]
-            elif isinstance(layout_merge_bboxes_mode, dict):
-                keep_mask = np.ones(len(boxes), dtype=bool)
-                for category_index, layout_mode in layout_merge_bboxes_mode.items():
-                    assert layout_mode in [
-                        "union",
-                        "large",
-                        "small",
-                    ], f"The value of `layout_merge_bboxes_mode` must be one of ['union', 'large', 'small'], but got {layout_mode}"
-                    if layout_mode == "union":
-                        pass
-                    else:
-                        if layout_mode == "large":
-                            if quad is not None:
-                                contains_other, contained_by_other = (
-                                    check_containment_quad(
-                                        quad,
-                                        boxes[:, 0],
-                                        formula_index,
-                                        category_index,
-                                        mode=layout_mode,
-                                    )
-                                )
-                            else:
-                                contains_other, contained_by_other = check_containment(
-                                    boxes[:, :6],
-                                    formula_index,
-                                    category_index,
-                                    mode=layout_mode,
-                                )
-                            # Remove boxes that are contained by other boxes
-                            keep_mask &= contained_by_other == 0
-                        elif layout_mode == "small":
-                            if quad is not None:
-                                contains_other, contained_by_other = (
-                                    check_containment_quad(
-                                        quad,
-                                        boxes[:, 0],
-                                        formula_index,
-                                        category_index,
-                                        mode=layout_mode,
-                                    )
-                                )
-                            else:
-                                contains_other, contained_by_other = check_containment(
-                                    boxes[:, :6],
-                                    formula_index,
-                                    category_index,
-                                    mode=layout_mode,
-                                )
-                            # Keep boxes that do not contain others or are contained by others
-                            keep_mask &= (contains_other == 0) | (
-                                contained_by_other == 1
-                            )
-                boxes = boxes[keep_mask]
-                if masks is not None:
-                    masks = [mask for i, mask in enumerate(masks) if keep_mask[i]]
+            modes = (
+                layout_merge_bboxes_mode.items()
+                if isinstance(layout_merge_bboxes_mode, dict)
+                else [(None, layout_merge_bboxes_mode)]
+            )
+            keep = np.ones(len(indices), dtype=bool)
+            for category_index, mode in modes:
+                if mode not in ("union", "large", "small"):
+                    raise ValueError(
+                        "layout_merge_bboxes_mode must be union, large or small"
+                    )
+                if mode == "union":
+                    continue
                 if quad is not None:
-                    quad = quad[keep_mask]
-                if polygon_points is not None:
-                    polygon_points = [
-                        p for p, keep in zip(polygon_points, keep_mask) if keep
-                    ]
+                    contains, contained = check_containment_quad(
+                        quad[indices],
+                        boxes[indices, 0],
+                        formula_index,
+                        category_index,
+                        mode if category_index is not None else None,
+                    )
+                else:
+                    contains, contained = check_containment(
+                        boxes[indices, :6],
+                        formula_index,
+                        category_index,
+                        mode if category_index is not None else None,
+                    )
+                keep &= (
+                    (contained == 0)
+                    if mode == "large"
+                    else ((contains == 0) | (contained == 1))
+                )
+            indices = indices[keep]
+        if not len(indices):
+            return []
 
-        if boxes.size == 0:
-            return np.array([])
+        if reading_order is not None:
+            indices = indices[np.argsort(reading_order[indices])]
+        elif boxes.shape[1] == 8:
+            indices = indices[np.lexsort((-boxes[indices, 7], boxes[indices, 6]))]
+        elif boxes.shape[1] == 7:
+            indices = indices[np.argsort(boxes[indices, 6])]
 
-        if boxes.shape[1] == 8:
-            # Sort boxes by their order
-            sorted_idx = np.lexsort((-boxes[:, 7], boxes[:, 6]))
-            sorted_boxes = boxes[sorted_idx]
-            boxes = sorted_boxes[:, :6]
-            if masks is not None:
-                sorted_masks = [masks[i] for i in sorted_idx]
-                masks = sorted_masks
-            if quad is not None:
-                quad = quad[sorted_idx]
-            if polygon_points is not None:
-                polygon_points = [polygon_points[i] for i in sorted_idx]
-
-        if boxes.shape[1] == 7:
-            # Sort boxes by their order
-            sorted_idx = np.argsort(boxes[:, 6])
-            sorted_boxes = boxes[sorted_idx]
-            boxes = sorted_boxes[:, :6]
-            if masks is not None:
-                sorted_masks = [masks[i] for i in sorted_idx]
-                masks = sorted_masks
-            if quad is not None:
-                quad = quad[sorted_idx]
-            if polygon_points is not None:
-                polygon_points = [polygon_points[i] for i in sorted_idx]
-
-        if polygon_points is None and masks is not None:
-            scale_ratio = [h / s for h, s in zip(self.scale_size, img_size)]
-            polygon_points = extract_polygon_points_by_masks(
-                boxes, np.array(masks), scale_ratio, layout_shape_mode, quad=quad
+        selected_boxes = boxes[indices, :6]
+        selected_quad = quad[indices] if quad is not None else None
+        selected_polygons = None
+        if masks is not None:
+            scale_ratio = [s / size for s, size in zip(self.scale_size, img_size)]
+            selected_polygons = extract_polygon_points_by_masks(
+                selected_boxes,
+                masks[indices],
+                scale_ratio,
+                layout_shape_mode,
+                quad=selected_quad,
             )
         elif polygon_points is not None:
-            polygon_points = normalize_polygon_points_by_boxes(
-                boxes, polygon_points, layout_shape_mode, quad=quad
+            selected_polygons = normalize_polygon_points_by_boxes(
+                selected_boxes,
+                [polygon_points[i] for i in indices],
+                layout_shape_mode,
+                quad=selected_quad,
             )
 
-        if layout_unclip_ratio:
-            if isinstance(layout_unclip_ratio, float):
-                layout_unclip_ratio = (layout_unclip_ratio, layout_unclip_ratio)
-            elif isinstance(layout_unclip_ratio, (tuple, list)):
-                assert (
-                    len(layout_unclip_ratio) == 2
-                ), f"The length of `layout_unclip_ratio` should be 2."
-            elif isinstance(layout_unclip_ratio, dict):
-                pass
-            else:
-                raise ValueError(
-                    f"The type of `layout_unclip_ratio` must be float, Tuple[float, float] or  Dict[int, Tuple[float, float]], but got {type(layout_unclip_ratio)}."
+        # Model and pipeline overlap filters must see pre-unclip geometry even
+        # though public coordinates describe the actual expanded recognition crop.
+        original_geometry = []
+        for position, box in enumerate(selected_boxes):
+            geometry = {
+                "coordinate": np.clip(
+                    box[2:6], [0, 0, 0, 0], [*img_size, *img_size]
+                ).tolist()
+            }
+            if selected_quad is not None:
+                geometry["quad"] = selected_quad[position].reshape(4, 2).tolist()
+            if selected_polygons is not None:
+                geometry["polygon_points"] = selected_polygons[position]
+            original_geometry.append(geometry)
+
+        centers = (
+            selected_boxes[:, 2:4]
+            + (selected_boxes[:, 4:6] - selected_boxes[:, 2:4]) / 2
+        )
+        selected_ratios = ratios[indices]
+        scaled_boxes = _scale_boxes(selected_boxes, centers, selected_ratios)
+        scaled_quad = None
+        if selected_quad is not None:
+            scaled_quad = _scale_points(
+                selected_quad.reshape(-1, 4, 2),
+                centers[:, None, :],
+                selected_ratios[:, None, :],
+            ).reshape(-1, 8)
+        scaled_polygons = None
+        if selected_polygons is not None:
+            scaled_polygons = [
+                _scale_points(points, center, ratio) if points is not None else None
+                for points, center, ratio in zip(
+                    selected_polygons, centers, selected_ratios
                 )
-            if quad is not None:
-                quad = _unclip_quads(quad, boxes, layout_unclip_ratio)
-            boxes = unclip_boxes(boxes, layout_unclip_ratio)
-
-        if boxes.shape[1] == 6:
-            """For Normal Object Detection"""
-            boxes = restructured_boxes(
-                boxes, self.labels, img_size, polygon_points, quad=quad
-            )
-        else:
-            """Unexpected Input Box Shape"""
-            raise ValueError(
-                f"The shape of boxes should be 6 or 10, instead of {boxes.shape[1]}"
-            )
-        return boxes
+            ]
+        return restructured_boxes(
+            scaled_boxes,
+            self.labels,
+            img_size,
+            scaled_polygons,
+            quad=scaled_quad,
+            filter_geometry=original_geometry,
+        )
 
     def __call__(
         self,
@@ -1422,7 +1257,7 @@ class LayoutAnalysisProcess:
             quad = output.get("quad", None)
             # Paddle mask models supply masks; Transformers supplies decoded
             # polygons instead. Keep V4's independent quad path in both cases.
-            polygon_points = output.get("polygon_points") if masks is None else None
+            polygon_points = output.get("polygon_points")
             if masks is None and quad is None and polygon_points is None:
                 current_layout_shape_mode = "rect"
                 if idx == 0 and layout_shape_mode not in ["rect", "auto"]:
