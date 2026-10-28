@@ -31,25 +31,13 @@ Boxes = List[dict]
 Number = Union[int, float]
 
 
-class _LayoutBox(dict):
-    """Export crop geometry, retaining detection geometry only in memory.
-
-    Both overlap filters run after model postprocessing, including in pipelines
-    that deepcopy results. A dict attribute preserves their original geometry
-    without adding fields to serialized model/pipeline output.
-    """
-
-    def __init__(self, data, filter_geometry):
-        super().__init__(data)
-        self._filter_geometry = filter_geometry
-
-    def copy(self):
-        return type(self)(self, self._filter_geometry)
-
-
 def get_layout_filter_geometry(box):
-    """Original detection geometry for filtering, or a plain caller's box."""
-    return getattr(box, "_filter_geometry", box)
+    """Use the explicit pre-unclip geometry, including after JSON round trips.
+
+    Only scaled detections carry ``original_geometry``. Plain detections and
+    external results without this optional field use their public geometry.
+    """
+    return box.get("original_geometry", box)
 
 
 SKIP_ORDER_LABELS = [
@@ -238,49 +226,41 @@ def extract_polygon_points_by_masks(
     h_m, w_m = masks.shape[1:]
     polygon_points = []
 
-    max_box_w = max(boxes[:, 4] - boxes[:, 3])
+    # Match the historical np.round used before mask extraction. Rasterizing
+    # and normalizing against the same integer box avoids a one-pixel shift.
+    coordinates = np.round(boxes[:, 2:6]).astype(np.int32)
+    if len(coordinates) == 0:
+        return []
+    max_box_w = np.max(coordinates[:, 2] - coordinates[:, 0])
 
     for i in range(len(boxes)):
-        x_min, y_min, x_max, y_max = boxes[i, 2:6].astype(np.int32)
+        x_min, y_min, x_max, y_max = coordinates[i]
         box_w, box_h = x_max - x_min, y_max - y_min
-        rect = _rect_from_box(boxes[i, 2:6])
-
-        if box_w <= 0 or box_h <= 0:
-            polygon_points.append(rect)
-            continue
-
-        # crop mask
-        x_s = np.clip(
-            [int(round(x_min * scale_w)), int(round(x_max * scale_w))], 0, w_m
-        )
-        y_s = np.clip(
-            [int(round(y_min * scale_h)), int(round(y_max * scale_h))], 0, h_m
-        )
-
-        cropped = masks[i, y_s[0] : y_s[1], x_s[0] : x_s[1]]
-        if cropped.size == 0 or np.sum(cropped) == 0:
-            polygon_points.append(rect)
-            continue
-
-        # resize mask to match box size
-        resized_mask = cv2.resize(
-            cropped.astype(np.uint8), (box_w, box_h), interpolation=cv2.INTER_NEAREST
-        )
-
-        if box_w > max_box_w * 0.6:
-            max_allowed_dist = box_w
-        else:
-            max_allowed_dist = max_box_w
-
-        polygon = mask2polygon(resized_mask, max_allowed_dist)
-        if polygon is not None and len(polygon) > 0:
-            polygon = polygon + np.array([x_min, y_min])
+        polygon = None
+        if box_w > 0 and box_h > 0:
+            x_s = np.clip(
+                [int(round(x_min * scale_w)), int(round(x_max * scale_w))], 0, w_m
+            )
+            y_s = np.clip(
+                [int(round(y_min * scale_h)), int(round(y_max * scale_h))], 0, h_m
+            )
+            cropped = masks[i, y_s[0] : y_s[1], x_s[0] : x_s[1]]
+            if cropped.size and np.any(cropped):
+                resized_mask = cv2.resize(
+                    cropped.astype(np.uint8),
+                    (box_w, box_h),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                max_allowed_dist = box_w if box_w > max_box_w * 0.6 else max_box_w
+                polygon = mask2polygon(resized_mask, max_allowed_dist)
+                if polygon is not None and len(polygon) > 0:
+                    polygon = polygon + np.array([x_min, y_min])
         model_quad = None
         if quad is not None:
             model_quad = quad[i].reshape(4, 2)
         polygon_points.append(
             _normalize_layout_polygon(
-                box=boxes[i, 2:6],
+                box=coordinates[i],
                 polygon=polygon,
                 layout_shape_mode=layout_shape_mode,
                 previous_polygon=(
@@ -332,7 +312,7 @@ def _normalize_layout_polygon(
 ):
     rect = _rect_from_box(box)
 
-    if polygon is None and model_quad is None:
+    if layout_shape_mode == "rect":
         return rect
 
     if polygon is not None:
@@ -340,10 +320,12 @@ def _normalize_layout_polygon(
         if polygon.ndim == 1:
             polygon = polygon.reshape(-1, 2)
 
-    if polygon is not None and len(polygon) < 4 and model_quad is None:
-        return rect
+    if polygon is None or polygon.size == 0:
+        # A mask may be empty, or contour extraction may fail. Keep a valid
+        # model quad rather than dropping the detection or dereferencing None.
+        return np.asarray(model_quad).reshape(4, 2) if model_quad is not None else rect
 
-    if layout_shape_mode == "rect":
+    if polygon is not None and len(polygon) < 4 and model_quad is None:
         return rect
 
     if layout_shape_mode == "poly":
@@ -420,16 +402,17 @@ def convert_polygon_to_quad(polygon):
     return quad
 
 
-def restructured_boxes(
+def _format_layout_boxes(
     boxes: ndarray,
     labels: List[str],
     img_size: Tuple[int, int],
     polygon_points: ndarray = None,
     quad: ndarray = None,
-    filter_geometry: Optional[List[dict]] = None,
+    filter_geometry: Optional[List[Optional[dict]]] = None,
+    scaled: Optional[ndarray] = None,
 ) -> Boxes:
     """
-    Restructure the given bounding boxes and labels based on the image size.
+    Format layout-specific geometry, order and optional pre-unclip boundaries.
 
     Args:
         boxes (ndarray): A 2D array of bounding boxes with each box represented as [cls_id, score, xmin, ymin, xmax, ymax].
@@ -445,12 +428,15 @@ def restructured_boxes(
 
     for idx, box in enumerate(boxes):
         xmin, ymin, xmax, ymax = box[2:]
-        # Quantize only the final crop bounds, outwards so fractional geometry
-        # cannot be cut off by the axis-aligned crop.
-        xmin = int(np.floor(np.clip(xmin, 0, w)))
-        ymin = int(np.floor(np.clip(ymin, 0, h)))
-        xmax = int(np.ceil(np.clip(xmax, 0, w)))
-        ymax = int(np.ceil(np.clip(ymax, 0, h)))
+        if scaled is not None and scaled[idx]:
+            # Only actual scaling needs outward crop bounds. Unchanged classes
+            # keep the historical rounded coordinates and result schema.
+            xmin, ymin = np.floor([xmin, ymin])
+            xmax, ymax = np.ceil([xmax, ymax])
+        xmin = int(max(0, xmin))
+        ymin = int(max(0, ymin))
+        xmax = int(min(w, xmax))
+        ymax = int(min(h, ymax))
         if xmax <= xmin or ymax <= ymin:
             continue
         res = {
@@ -467,15 +453,15 @@ def restructured_boxes(
             res["polygon_points"] = polygon_point
         if quad is not None:
             res["quad"] = quad[idx].reshape(4, 2).tolist()
-        if filter_geometry is not None:
-            res = _LayoutBox(res, filter_geometry[idx])
+        if filter_geometry is not None and filter_geometry[idx] is not None:
+            res["original_geometry"] = filter_geometry[idx]
         box_list.append(res)
 
     return box_list
 
 
 def _resolve_unclip_ratios(class_ids, unclip_ratio):
-    """Resolve scalar, x/y pair or per-class ratios once for all crop shapes."""
+    """Resolve ratios once; return None when no detection needs scaling."""
 
     def pair(value):
         values = np.asarray(value, dtype=np.float64)
@@ -488,14 +474,18 @@ def _resolve_unclip_ratios(class_ids, unclip_ratio):
         return values
 
     if unclip_ratio is None:
-        return np.ones((len(class_ids), 2), dtype=np.float64)
+        return None
     if isinstance(unclip_ratio, dict):
         normalized = {key: pair(value) for key, value in unclip_ratio.items()}
-        return np.asarray(
+        if all(np.all(value == 1) for value in normalized.values()):
+            return None
+        ratios = np.asarray(
             [normalized.get(int(class_id), (1.0, 1.0)) for class_id in class_ids],
             dtype=np.float64,
         ).reshape(-1, 2)
-    return np.broadcast_to(pair(unclip_ratio), (len(class_ids), 2))
+        return None if np.all(ratios == 1) else ratios
+    ratios = pair(unclip_ratio)
+    return None if np.all(ratios == 1) else np.broadcast_to(ratios, (len(class_ids), 2))
 
 
 def _scale_points(points, centers, ratios):
@@ -510,15 +500,6 @@ def _scale_boxes(boxes, centers, ratios):
         scaled[:, 2:6].reshape(-1, 2, 2), centers[:, None, :], ratios[:, None, :]
     ).reshape(-1, 4)
     return scaled
-
-
-def unclip_boxes(boxes, unclip_ratio=None):
-    """Scale [class, score, xmin, ymin, xmax, ymax, ...] without quantization."""
-    boxes = np.asarray(boxes, dtype=np.float64)
-    centers = boxes[:, 2:4] + (boxes[:, 4:6] - boxes[:, 2:4]) / 2
-    return _scale_boxes(
-        boxes, centers, _resolve_unclip_ratios(boxes[:, 0], unclip_ratio)
-    )
 
 
 def _validate_geometry_counts(boxes, **geometry):
@@ -1044,14 +1025,16 @@ class LayoutAnalysisProcess:
     ) -> Boxes:
         """Filter original detections by index, then scale all crop geometry.
 
-        Keep source arrays and floating-point coordinates intact. Only the
-        retained indices change during filtering/sorting; gather masks, quads
-        and variable-length polygons together after the final ordering.
+        Keep floating-point source coordinates for scaling, but preserve the
+        historical rounded AABBs for filters and mask normalization. Only the
+        retained indices change while filtering and sorting.
         """
-        boxes = np.asarray(boxes, dtype=np.float64)
+        source_boxes = np.asarray(boxes)
         _validate_geometry_counts(
-            boxes, masks=masks, quad=quad, polygon_points=polygon_points, qi=qi
+            source_boxes, masks=masks, quad=quad, polygon_points=polygon_points, qi=qi
         )
+        boxes = np.array(source_boxes, dtype=np.float64, copy=True)
+        boxes[:, 2:6] = np.round(boxes[:, 2:6])
         ratios = _resolve_unclip_ratios(boxes[:, 0], layout_unclip_ratio)
         if layout_shape_mode == "rect":
             masks = quad = polygon_points = None
@@ -1059,7 +1042,7 @@ class LayoutAnalysisProcess:
             # Preserve Paddle's mask precedence over decoded Transformers polygons.
             polygon_points = None
         if quad is not None:
-            quad = np.asarray(quad, dtype=np.float64).reshape(len(boxes), 8)
+            quad = np.asarray(quad).reshape(len(boxes), 8)
         if masks is not None:
             masks = np.asarray(masks)
         if qi is not None:
@@ -1184,49 +1167,70 @@ class LayoutAnalysisProcess:
                 quad=selected_quad,
             )
 
-        # Model and pipeline overlap filters must see pre-unclip geometry even
-        # though public coordinates describe the actual expanded recognition crop.
-        original_geometry = []
+        selected_ratios = ratios[indices] if ratios is not None else None
+        if selected_ratios is None or np.all(selected_ratios == 1):
+            return _format_layout_boxes(
+                selected_boxes,
+                self.labels,
+                img_size,
+                selected_polygons,
+                quad=selected_quad,
+            )
+
+        # Persist only changed detections' pre-unclip geometry. Pipeline filters
+        # can then make identical decisions after dict copies or serialization.
+        scaled = np.any(selected_ratios != 1, axis=1)
+        original_geometry = [None] * len(indices)
         for position, box in enumerate(selected_boxes):
+            if not scaled[position]:
+                continue
             geometry = {
-                "coordinate": np.clip(
-                    box[2:6], [0, 0, 0, 0], [*img_size, *img_size]
-                ).tolist()
+                "coordinate": np.clip(box[2:6], [0, 0, 0, 0], [*img_size, *img_size])
+                .astype(int)
+                .tolist()
             }
             if selected_quad is not None:
                 geometry["quad"] = selected_quad[position].reshape(4, 2).tolist()
             if selected_polygons is not None:
-                geometry["polygon_points"] = selected_polygons[position]
-            original_geometry.append(geometry)
+                polygon = selected_polygons[position]
+                if polygon is not None:
+                    geometry["polygon_points"] = polygon.tolist()
+            original_geometry[position] = geometry
 
-        centers = (
-            selected_boxes[:, 2:4]
-            + (selected_boxes[:, 4:6] - selected_boxes[:, 2:4]) / 2
+        source = source_boxes[indices, :6].astype(np.float64, copy=False)
+        centers = source[:, 2:4] + (source[:, 4:6] - source[:, 2:4]) / 2
+        scaled_boxes = selected_boxes.copy()
+        scaled_boxes[scaled] = _scale_boxes(
+            source[scaled], centers[scaled], selected_ratios[scaled]
         )
-        selected_ratios = ratios[indices]
-        scaled_boxes = _scale_boxes(selected_boxes, centers, selected_ratios)
         scaled_quad = None
         if selected_quad is not None:
-            scaled_quad = _scale_points(
-                selected_quad.reshape(-1, 4, 2),
-                centers[:, None, :],
-                selected_ratios[:, None, :],
+            scaled_quad = selected_quad.astype(np.float64, copy=True)
+            scaled_quad[scaled] = _scale_points(
+                selected_quad[scaled].reshape(-1, 4, 2),
+                centers[scaled, None, :],
+                selected_ratios[scaled, None, :],
             ).reshape(-1, 8)
         scaled_polygons = None
         if selected_polygons is not None:
             scaled_polygons = [
-                _scale_points(points, center, ratio) if points is not None else None
-                for points, center, ratio in zip(
-                    selected_polygons, centers, selected_ratios
+                (
+                    _scale_points(points, center, ratio)
+                    if changed and points is not None
+                    else points
+                )
+                for points, center, ratio, changed in zip(
+                    selected_polygons, centers, selected_ratios, scaled
                 )
             ]
-        return restructured_boxes(
+        return _format_layout_boxes(
             scaled_boxes,
             self.labels,
             img_size,
             scaled_polygons,
             quad=scaled_quad,
             filter_geometry=original_geometry,
+            scaled=scaled,
         )
 
     def __call__(

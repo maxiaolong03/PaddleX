@@ -25,6 +25,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from PIL import Image
 
+from ...models.layout_analysis.processors import get_layout_filter_geometry
 from ..components import convert_points_to_boxes
 from ..ocr.result import OCRResult
 from .setting import BLOCK_LABEL_MAP, REGION_SETTINGS
@@ -443,8 +444,8 @@ def remove_overlap_blocks(
                 continue
             # Check for overlap and determine which block to remove
             overlap_box_index = _get_minbox_if_overlap_by_ratio(
-                block1["coordinate"],
-                block2["coordinate"],
+                get_layout_filter_geometry(block1)["coordinate"],
+                get_layout_filter_geometry(block2)["coordinate"],
                 threshold,
                 smaller=smaller,
             )

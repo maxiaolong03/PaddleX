@@ -221,8 +221,8 @@ def test_fractional_geometry_uses_one_float_center(kind, ratio):
     np.testing.assert_array_equal(output[key], before[key])
 
 
-def test_internal_filter_geometry_does_not_leak_into_json():
-    boxes = _process(_square_output("quad"), ratio=2.0)
+def test_identity_geometry_preserves_json_schema():
+    boxes = _process(_square_output("quad"), ratio=1.0)
     result = LayoutAnalysisResult(
         {"input_img": np.zeros((400, 400, 3), dtype=np.uint8), "boxes": boxes}
     )
@@ -235,7 +235,7 @@ def test_internal_filter_geometry_does_not_leak_into_json():
         "order",
         "quad",
     }
-    assert encoded["res"]["boxes"][0]["coordinate"] == [30, 30, 70, 70]
+    assert encoded["res"]["boxes"][0]["coordinate"] == [40, 40, 60, 60]
 
 
 @pytest.mark.parametrize("ratio", [{0: 2.0}, {0: [2.0, 1.5]}, {0: (2.0, 1.5)}])

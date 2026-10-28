@@ -185,10 +185,11 @@ for res in output:
 <ul>
 <li><b>float</b>，大于0的浮点数，如 1.1，表示将检测框中心不变、宽和高都扩张1.1倍</li>
 <li><b>列表</b>，如 [1.2, 1.5]，表示宽度扩张1.2倍、高度扩张1.5倍</li>
-<li><b>字典</b>，key为<b>int</b>类型的<code>cls_id</code>，value支持正数或横、纵轴比例组成的列表、元组，如 <code>{0: (1.1, 2.0), 1: 1.2}</code>；未指定的类别保持原大小</li>
+<li><b>字典</b>，key为<b>int</b>类型的<code>cls_id</code>，value为横、纵轴比例组成的元组，如 <code>{0: (1.1, 2.0)}</code>；未指定的类别保持原大小。PP-DocLayoutV2/V3/V4 的 value 还支持正数或列表，如 <code>{0: [1.1, 2.0], 1: 1.2}</code></li>
 <li><b>None</b>，不指定，将默认使用PaddleX官方模型配置</li>
 </ul>
-检测框、四边形及多边形边界使用原始浮点检测框的中心，沿原图横、纵轴同步缩放，支持 PP-DocLayoutV3 Transformers 多边形以及同时输出 mask 和 quad 的 Paddle 模型。缩放后的边界用于普通裁图、90°旋转和完整几何矫正裁图，最终矩形裁图边界向外取整并裁到图像范围内；比例为 1 时不改变浮点边界。NMS、包含关系及重叠过滤始终使用扩框前的检测几何，扩框比例不改变过滤结果。
+<p>对于 PP-DocLayoutV2/V3/V4，实际缩放时，检测框、quad 和 polygon 以原始未取整检测框的中心为基准，沿原图横、纵轴同步缩放，缩放后的边界用于普通裁图、90°旋转和完整几何矫正裁图。实际缩放类别的矩形 <code>coordinate</code> 向外取整并裁到图像范围内；比例为 1 或未配置缩放的类别沿用历史的 <code>np.round</code> 坐标取整，例如横坐标 <code>10.6..20.4</code> 输出为 <code>[11, 20]</code>，不执行几何缩放，也不附加原始几何副本。mask 的轮廓提取与形状选择使用同一份取整检测框。</p>
+<p>上述模型的 NMS 和包含关系过滤保留历史的取整检测框及 quad 优先规则。实际缩放的检测结果额外提供 <code>original_geometry</code> 字段，保存扩框前用于过滤的 <code>coordinate</code> 及可选的 <code>quad</code>、<code>polygon_points</code>。版面模型的重叠过滤、PaddleOCR-VL 的重叠过滤及 PP-StructureV3 的 <code>remove_overlap_blocks</code> 使用该字段判断是否保留检测，裁图仍使用缩放后的公开边界。通过字典或 JSON 传递 <code>layout_det_res</code> 时，请保留此字段；未提供该字段的外部检测结果按其公开边界进行过滤。</p>
 </td>
 <td>None</td>
 </tr>
