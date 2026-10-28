@@ -217,7 +217,7 @@ def mask2polygon(mask, max_allowed_dist, epsilon_ratio=0.004, extract_custom=Tru
 
 
 def extract_polygon_points_by_masks(
-    boxes, masks, scale_ratio, layout_shape_mode, quad=None
+    boxes, masks, scale_ratio, layout_shape_mode, quad=None, return_sources=False
 ):
     """
     修改后的提取函数：auto 模式下信任几何决策
@@ -230,7 +230,7 @@ def extract_polygon_points_by_masks(
     # and normalizing against the same integer box avoids a one-pixel shift.
     coordinates = np.round(boxes[:, 2:6]).astype(np.int32)
     if len(coordinates) == 0:
-        return []
+        return ([], []) if return_sources else []
     max_box_w = np.max(coordinates[:, 2] - coordinates[:, 0])
 
     for i in range(len(boxes)):
@@ -264,17 +264,24 @@ def extract_polygon_points_by_masks(
                 polygon=polygon,
                 layout_shape_mode=layout_shape_mode,
                 previous_polygon=(
-                    polygon_points[-1] if len(polygon_points) > 0 else None
+                    (polygon_points[-1][0] if return_sources else polygon_points[-1])
+                    if polygon_points
+                    else None
                 ),
                 model_quad=model_quad,
+                return_source=return_sources,
             )
         )
 
+    if return_sources:
+        return [item[0] for item in polygon_points], [
+            item[1] for item in polygon_points
+        ]
     return polygon_points
 
 
 def normalize_polygon_points_by_boxes(
-    boxes, polygon_points, layout_shape_mode, quad=None
+    boxes, polygon_points, layout_shape_mode, quad=None, return_sources=False
 ):
     normalized_points = []
 
@@ -286,12 +293,23 @@ def normalize_polygon_points_by_boxes(
                 polygon=polygon,
                 layout_shape_mode=layout_shape_mode,
                 previous_polygon=(
-                    normalized_points[-1] if len(normalized_points) > 0 else None
+                    (
+                        normalized_points[-1][0]
+                        if return_sources
+                        else normalized_points[-1]
+                    )
+                    if normalized_points
+                    else None
                 ),
                 model_quad=model_quad,
+                return_source=return_sources,
             )
         )
 
+    if return_sources:
+        return [item[0] for item in normalized_points], [
+            item[1] for item in normalized_points
+        ]
     return normalized_points
 
 
@@ -309,11 +327,15 @@ def _normalize_layout_polygon(
     layout_shape_mode,
     previous_polygon=None,
     model_quad=None,
+    return_source=False,
 ):
+    def result(points, source):
+        return (points, source) if return_source else points
+
     rect = _rect_from_box(box)
 
     if layout_shape_mode == "rect":
-        return rect
+        return result(rect, "rect")
 
     if polygon is not None:
         polygon = np.asarray(polygon, dtype=np.float64)
@@ -323,13 +345,17 @@ def _normalize_layout_polygon(
     if polygon is None or polygon.size == 0:
         # A mask may be empty, or contour extraction may fail. Keep a valid
         # model quad rather than dropping the detection or dereferencing None.
-        return np.asarray(model_quad).reshape(4, 2) if model_quad is not None else rect
+        return (
+            result(np.asarray(model_quad).reshape(4, 2), "model_quad")
+            if model_quad is not None
+            else result(rect, "rect")
+        )
 
     if polygon is not None and len(polygon) < 4 and model_quad is None:
-        return rect
+        return result(rect, "rect")
 
     if layout_shape_mode == "poly":
-        return polygon
+        return result(polygon, "polygon")
 
     # Use model_quad directly if available, otherwise compute from polygon
     if model_quad is not None:
@@ -338,7 +364,9 @@ def _normalize_layout_polygon(
         quad = convert_polygon_to_quad(polygon)
 
     if layout_shape_mode == "quad":
-        return quad if quad is not None else rect
+        if quad is None:
+            return result(rect, "rect")
+        return result(quad, "model_quad" if model_quad is not None else "polygon")
 
     if layout_shape_mode == "auto":
         rect_list = rect.tolist()
@@ -348,7 +376,7 @@ def _normalize_layout_polygon(
                 rect_list, quad_list, mode="union"
             )
             if iou_rect_quad >= 0.95:
-                return rect
+                return result(rect, "rect")
 
             poly_list = polygon.tolist()
             iou_poly_quad = calculate_polygon_overlap_ratio(
@@ -364,9 +392,11 @@ def _normalize_layout_polygon(
                 )
 
             if iou_poly_quad >= 0.8 and iou_pre < 0.01:
-                return quad
+                return result(
+                    quad, "model_quad" if model_quad is not None else "polygon"
+                )
 
-        return polygon
+        return result(polygon, "polygon")
 
     raise ValueError(
         "layout_shape_mode must be one of ['rect', 'poly', 'quad', 'auto']"
@@ -431,6 +461,14 @@ def _format_layout_boxes(
         if scaled is not None and scaled[idx]:
             # Only actual scaling needs outward crop bounds. Unchanged classes
             # keep the historical rounded coordinates and result schema.
+            for points in (
+                polygon_points[idx] if polygon_points is not None else None,
+                quad[idx] if quad is not None else None,
+            ):
+                if points is not None:
+                    points = np.asarray(points).reshape(-1, 2)
+                    xmin, ymin = np.minimum([xmin, ymin], points.min(axis=0))
+                    xmax, ymax = np.maximum([xmax, ymax], points.max(axis=0))
             xmin, ymin = np.floor([xmin, ymin])
             xmax, ymax = np.ceil([xmax, ymax])
         xmin = int(max(0, xmin))
@@ -1149,6 +1187,9 @@ class LayoutAnalysisProcess:
 
         selected_boxes = boxes[indices, :6]
         selected_quad = quad[indices] if quad is not None else None
+        selected_ratios = ratios[indices] if ratios is not None else None
+        track_sources = selected_ratios is not None and np.any(selected_ratios != 1)
+        polygon_sources = None
         selected_polygons = None
         if masks is not None:
             scale_ratio = [s / size for s, size in zip(self.scale_size, img_size)]
@@ -1158,6 +1199,7 @@ class LayoutAnalysisProcess:
                 scale_ratio,
                 layout_shape_mode,
                 quad=selected_quad,
+                return_sources=track_sources,
             )
         elif polygon_points is not None:
             selected_polygons = normalize_polygon_points_by_boxes(
@@ -1165,9 +1207,11 @@ class LayoutAnalysisProcess:
                 [polygon_points[i] for i in indices],
                 layout_shape_mode,
                 quad=selected_quad,
+                return_sources=track_sources,
             )
 
-        selected_ratios = ratios[indices] if ratios is not None else None
+        if track_sources and selected_polygons is not None:
+            selected_polygons, polygon_sources = selected_polygons
         if selected_ratios is None or np.all(selected_ratios == 1):
             return _format_layout_boxes(
                 selected_boxes,
@@ -1213,6 +1257,19 @@ class LayoutAnalysisProcess:
             ).reshape(-1, 8)
         scaled_polygons = None
         if selected_polygons is not None:
+            # Raster contours, their fitted quads and rounded-rectangle fallbacks
+            # belong to the rounded box frame. Model quads and decoded polygons
+            # retain the floating-point model frame.
+            polygon_centers = centers.copy()
+            rounded = np.array(
+                [
+                    kind == "rect" or (masks is not None and kind == "polygon")
+                    for kind in polygon_sources
+                ]
+            )
+            polygon_centers[rounded] = (
+                selected_boxes[rounded, 2:4] + selected_boxes[rounded, 4:6]
+            ) / 2
             scaled_polygons = [
                 (
                     _scale_points(points, center, ratio)
@@ -1220,7 +1277,7 @@ class LayoutAnalysisProcess:
                     else points
                 )
                 for points, center, ratio, changed in zip(
-                    selected_polygons, centers, selected_ratios, scaled
+                    selected_polygons, polygon_centers, selected_ratios, scaled
                 )
             ]
         return _format_layout_boxes(

@@ -22,6 +22,9 @@ import pytest
 from paddlex.inference.models.layout_analysis import processors
 from paddlex.inference.models.layout_analysis.result import LayoutAnalysisResult
 from paddlex.inference.pipelines.components.common.crop_image_regions import CropByBoxes
+from paddlex.inference.pipelines.components.common.page_rectify import (
+    plan_page_correction,
+)
 from paddlex.inference.pipelines.layout_parsing.utils import remove_overlap_blocks
 from paddlex.inference.pipelines.paddleocr_vl.uilts import filter_overlap_boxes
 
@@ -313,3 +316,97 @@ def test_mask_vertex_distance_uses_width_not_xmax_minus_ymin(monkeypatch):
     }
     assert len(_process(output, shape="poly")) == 2
     assert distances == [40, 40]
+
+
+@pytest.mark.parametrize("shape", ["poly", "auto", "quad"])
+@pytest.mark.parametrize(
+    "ratio,low,high,bounds",
+    [
+        (3.0, [170, 170], [227, 227], [170, 170, 231, 231]),
+        (5.0, [150, 150], [245, 245], [150, 150, 251, 251]),
+        ({0: (5.0, 3.0)}, [150, 170], [245, 227], [150, 170, 251, 231]),
+    ],
+)
+@pytest.mark.parametrize("correction", ["plain", "quarter_turn", "homography"])
+def test_fractional_mask_scales_in_its_rounded_pixel_frame(
+    shape, ratio, low, high, bounds, correction
+):
+    output = {
+        "boxes": np.array([[0, 0.9, 190.4, 190.4, 210.4, 210.4]]),
+        "masks": np.ones((1, 100, 100), dtype=np.uint8),
+    }
+    box = _process(output, ratio=ratio, shape=shape)[0]
+    points = np.asarray(box["polygon_points"])
+    expected = np.array(
+        [[low[0], low[1]], [high[0], low[1]], [high[0], high[1]], [low[0], high[1]]]
+    )
+    np.testing.assert_array_equal(
+        points[np.lexsort(points.T)], expected[np.lexsort(expected.T)]
+    )
+    assert box["coordinate"] == bounds
+    local = points.astype(np.int32) - bounds[:2]
+    assert np.all(local >= 0)
+    image = np.random.default_rng(9).integers(0, 256, (400, 400, 3), dtype=np.uint8)
+    kwargs = {}
+    if correction != "plain":
+        params = (
+            (90, 1, 0, 0, 0) if correction == "quarter_turn" else (7, 1, -3, 0.1, -0.05)
+        )
+        plan = plan_page_correction(image.shape, params)
+        kwargs = {"page_homography": plan.homography, "rot90_k": plan.rot90_k}
+    actual = CropByBoxes()(image, [box], shape, **kwargs)[0]["img"]
+    reference = CropByBoxes()(
+        image, [dict(box, polygon_points=expected)], shape, **kwargs
+    )[0]["img"]
+    np.testing.assert_array_equal(actual, reference)
+
+
+def test_rounded_mask_width_is_enclosed_after_scaling():
+    box = _process(
+        {
+            "boxes": np.array([[0, 0.9, 190.4, 190.4, 209.6, 209.6]]),
+            "masks": np.ones((1, 100, 100), dtype=np.uint8),
+        },
+        ratio=5.0,
+        shape="poly",
+    )[0]
+    assert box["coordinate"] == [150, 150, 248, 248]
+    points = np.asarray(box["polygon_points"])
+    np.testing.assert_array_equal(points.min(0), [150, 150])
+    np.testing.assert_array_equal(points.max(0), [245, 245])
+
+
+@pytest.mark.parametrize("shape", ["auto", "quad"])
+@pytest.mark.parametrize("empty_mask", [False, True])
+@pytest.mark.parametrize("ratio", [3.0, 5.0])
+def test_mask_selected_model_quad_keeps_float_center(shape, empty_mask, ratio):
+    points = np.array([[190.4, 190.4], [210.4, 190.4], [210.4, 210.4], [190.4, 210.4]])
+    box = _process(
+        {
+            "boxes": np.array([[0, 0.9, 190.4, 190.4, 210.4, 210.4]]),
+            "quad": points.reshape(1, 8),
+            "masks": np.full((1, 100, 100), not empty_mask, dtype=np.uint8),
+        },
+        ratio=ratio,
+        shape=shape,
+    )[0]
+    expected = (points - 200.4) * ratio + 200.4
+    np.testing.assert_allclose(box["quad"], expected, atol=1e-10)
+    np.testing.assert_array_equal(box["polygon_points"], box["quad"])
+
+
+def test_auto_rectangle_with_model_quad_uses_rounded_frame():
+    points = np.array([[150.4, 150.4], [250.4, 150.4], [250.4, 250.4], [150.4, 250.4]])
+    box = _process(
+        {
+            "boxes": np.array([[0, 0.9, 150.4, 150.4, 250.4, 250.4]]),
+            "quad": points.reshape(1, 8),
+            "masks": np.ones((1, 100, 100), dtype=np.uint8),
+        },
+        ratio=3.0,
+        shape="auto",
+    )[0]
+    np.testing.assert_array_equal(
+        box["polygon_points"], [[50, 50], [350, 50], [350, 350], [50, 350]]
+    )
+    assert box["coordinate"] == [50, 50, 351, 351]
