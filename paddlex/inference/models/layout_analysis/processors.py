@@ -25,6 +25,8 @@ from .utils import compute_reading_order
 
 if is_dep_available("opencv-contrib-python"):
     import cv2
+if is_dep_available("shapely"):
+    from shapely.geometry import Polygon
 
 Boxes = List[dict]
 Number = Union[int, float]
@@ -206,9 +208,7 @@ def mask2polygon(mask, max_allowed_dist, epsilon_ratio=0.004, extract_custom=Tru
     return polygon_points
 
 
-def extract_polygon_points_by_masks(
-    boxes, masks, scale_ratio, layout_shape_mode, quad=None
-):
+def extract_polygon_points_by_masks(boxes, masks, scale_ratio, layout_shape_mode):
     """
     修改后的提取函数：auto 模式下信任几何决策
     """
@@ -253,9 +253,6 @@ def extract_polygon_points_by_masks(
         polygon = mask2polygon(resized_mask, max_allowed_dist)
         if polygon is not None and len(polygon) > 0:
             polygon = polygon + np.array([x_min, y_min])
-        model_quad = None
-        if quad is not None:
-            model_quad = quad[i].reshape(4, 2)
         polygon_points.append(
             _normalize_layout_polygon(
                 box=boxes[i, 2:6],
@@ -264,20 +261,16 @@ def extract_polygon_points_by_masks(
                 previous_polygon=(
                     polygon_points[-1] if len(polygon_points) > 0 else None
                 ),
-                model_quad=model_quad,
             )
         )
 
     return polygon_points
 
 
-def normalize_polygon_points_by_boxes(
-    boxes, polygon_points, layout_shape_mode, quad=None
-):
+def normalize_polygon_points_by_boxes(boxes, polygon_points, layout_shape_mode):
     normalized_points = []
 
-    for i, (polygon, box) in enumerate(zip(polygon_points, boxes)):
-        model_quad = quad[i].reshape(4, 2) if quad is not None else None
+    for polygon, box in zip(polygon_points, boxes):
         normalized_points.append(
             _normalize_layout_polygon(
                 box=box[2:6],
@@ -286,7 +279,6 @@ def normalize_polygon_points_by_boxes(
                 previous_polygon=(
                     normalized_points[-1] if len(normalized_points) > 0 else None
                 ),
-                model_quad=model_quad,
             )
         )
 
@@ -306,19 +298,17 @@ def _normalize_layout_polygon(
     polygon,
     layout_shape_mode,
     previous_polygon=None,
-    model_quad=None,
 ):
     rect = _rect_from_box(box)
 
-    if polygon is None and model_quad is None:
+    if polygon is None:
         return rect
 
-    if polygon is not None:
-        polygon = np.asarray(polygon, dtype=np.float32)
-        if polygon.ndim == 1:
-            polygon = polygon.reshape(-1, 2)
+    polygon = np.asarray(polygon, dtype=np.float32)
+    if polygon.ndim == 1:
+        polygon = polygon.reshape(-1, 2)
 
-    if polygon is not None and len(polygon) < 4 and model_quad is None:
+    if len(polygon) < 4:
         return rect
 
     if layout_shape_mode == "rect":
@@ -327,19 +317,14 @@ def _normalize_layout_polygon(
     if layout_shape_mode == "poly":
         return polygon
 
-    # Use model_quad directly if available, otherwise compute from polygon
-    if model_quad is not None:
-        quad = model_quad
-    else:
-        quad = convert_polygon_to_quad(polygon)
-
+    quad = convert_polygon_to_quad(polygon)
     if layout_shape_mode == "quad":
         return quad if quad is not None else rect
 
     if layout_shape_mode == "auto":
         rect_list = rect.tolist()
         if quad is not None:
-            quad_list = quad.tolist() if isinstance(quad, np.ndarray) else quad
+            quad_list = quad.tolist()
             iou_rect_quad = calculate_polygon_overlap_ratio(
                 rect_list, quad_list, mode="union"
             )
@@ -413,7 +398,7 @@ def restructured_boxes(
         labels (List[str]): A list of class labels corresponding to the class ids.
         img_size (Tuple[int, int]): A tuple representing the width and height of the image.
         polygon_points (ndarray): A 2D array of polygon points with each point represented as [x, y].
-        quad (ndarray, optional): Quad coordinates [N, 8] for 4-point box models.
+        quad (ndarray, optional): Corners [N, 8] predicted by 4-point models.
     Returns:
         Boxes: A list of dictionaries, each containing 'cls_id', 'label', 'score', and 'coordinate' keys.
     """
@@ -503,6 +488,48 @@ def unclip_boxes(boxes, unclip_ratio=None):
             (boxes[:, 0], boxes[:, 1], new_x1, new_y1, new_x2, new_y2)
         )
         return expanded_boxes
+
+
+def _unclip_ratios(boxes, unclip_ratio):
+    """Return the (width_ratio, height_ratio) that ``unclip_boxes`` uses per box.
+
+    ``unclip_ratio`` is a (width_ratio, height_ratio) pair or a per-class dict of
+    pairs, as normalized by ``LayoutAnalysisProcess.apply``.
+    """
+    if isinstance(unclip_ratio, dict):
+        return np.asarray(
+            [unclip_ratio.get(int(class_id), (1.0, 1.0)) for class_id in boxes[:, 0]],
+            dtype=np.float64,
+        ).reshape(-1, 2)
+    return np.broadcast_to(np.asarray(unclip_ratio, dtype=np.float64), (len(boxes), 2))
+
+
+def _unclip_quads(quad, boxes, unclip_ratio):
+    """Scale quads about the AABB centers used by ``unclip_boxes``.
+
+    Corners outside the page are kept as-is, since clipping them would distort
+    the quad.
+    """
+    ratios = _unclip_ratios(boxes, unclip_ratio)
+    centers = (boxes[:, 2:4] + boxes[:, 4:6]) / 2
+    points = quad.reshape(-1, 4, 2)
+    # Add only the displacement, so a ratio of 1 leaves the corners bit-identical.
+    return (
+        points + (points - centers[:, None, :]) * (ratios[:, None, :] - 1.0)
+    ).reshape(-1, 8)
+
+
+def _unclip_polygons(polygon_points, boxes, unclip_ratio):
+    """Scale polygons like ``_unclip_quads``, keeping the dtype of each."""
+    ratios = _unclip_ratios(boxes, unclip_ratio)
+    centers = (boxes[:, 2:4] + boxes[:, 4:6]) / 2
+    unclipped = []
+    for points, center, ratio in zip(polygon_points, centers, ratios):
+        points = np.asarray(points)
+        unclipped.append(
+            (points + (points - center) * (ratio - 1.0)).astype(points.dtype)
+        )
+    return unclipped
 
 
 def make_valid(poly):
@@ -605,209 +632,99 @@ def calculate_overlap_ratio(
     return inter_area / ref_area
 
 
-def quad_iou(quad1, quad2):
-    """Compute IoU between two quad polygons.
-    Corresponds to iou(box1, box2): inter / (area1 + area2 - inter)
-    Args:
-        quad1, quad2: ndarray of shape [8], i.e. [x1,y1,x2,y2,x3,y3,x4,y4]
-    Returns:
-        float: IoU value
-    """
-    from shapely.geometry import Polygon as ShapelyPolygon
+@function_requires_deps("shapely")
+def _quad_geometry(quads):
+    """Build the polygons, areas and AABBs of quads [N, 8] once.
 
-    p1 = ShapelyPolygon(quad1.reshape(4, 2))
-    p2 = ShapelyPolygon(quad2.reshape(4, 2))
-    if not p1.is_valid:
-        p1 = p1.buffer(0)
-    if not p2.is_valid:
-        p2 = p2.buffer(0)
-    inter = p1.intersection(p2).area
-    union_area = p1.area + p2.area - inter
-    return inter / union_area if union_area > 0 else 0.0
+    The pairwise helpers below are O(N^2), so the shapely polygons are built a
+    single time per box rather than per pair.
+    """
+    points = np.asarray(quads, dtype=np.float64).reshape(-1, 4, 2)
+    polygons = [make_valid(Polygon(p)) for p in points]
+    areas = np.array([p.area for p in polygons], dtype=np.float64)
+    extents = np.concatenate([points.min(axis=1), points.max(axis=1)], axis=1)
+    return polygons, areas, extents
+
+
+def _quad_intersection(geometry, i, j):
+    """Intersection area of quads ``i`` and ``j`` of ``_quad_geometry`` output."""
+    polygons, _, extents = geometry
+    a, b = extents[i], extents[j]
+    # Disjoint (or edge-touching) AABBs cannot share any area.
+    if a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1]:
+        return 0.0
+    return polygons[i].intersection(polygons[j]).area
+
+
+def quad_area(quad):
+    """Calculate the area of a quad [x1, y1, ..., x4, y4] (shoelace formula)."""
+    x, y = np.asarray(quad, dtype=np.float64).reshape(4, 2).T
+    return float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) / 2)
 
 
 def quad_overlap_ratio(quad1, quad2, mode="union"):
-    """Compute overlap ratio between two quad polygons.
-    Corresponds to calculate_overlap_ratio(bbox1, bbox2, mode).
-    Args:
-        quad1, quad2: ndarray of shape [8]
-        mode: "union", "small", or "large"
-    Returns:
-        float: overlap ratio
     """
-    from shapely.geometry import Polygon as ShapelyPolygon
+    Calculate the overlap ratio between two quads, the polygon counterpart of
+    ``calculate_overlap_ratio``.
 
-    p1 = ShapelyPolygon(quad1.reshape(4, 2))
-    p2 = ShapelyPolygon(quad2.reshape(4, 2))
-    if not p1.is_valid:
-        p1 = p1.buffer(0)
-    if not p2.is_valid:
-        p2 = p2.buffer(0)
-    inter = p1.intersection(p2).area
+    Args:
+        quad1 (array-like): The first quad, [x1, y1, ..., x4, y4] or [[x, y], ...].
+        quad2 (array-like): The second quad, in the same format.
+        mode (str): The mode of calculation, either 'union', 'small', or 'large'.
+
+    Returns:
+        float: The overlap ratio value between the two quads.
+    """
+    geometry = _quad_geometry([np.ravel(quad1), np.ravel(quad2)])
+    inter_area = _quad_intersection(geometry, 0, 1)
+    area1, area2 = geometry[1]
     if mode == "union":
-        ref = p1.area + p2.area - inter
+        ref_area = area1 + area2 - inter_area
     elif mode == "small":
-        ref = min(p1.area, p2.area)
+        ref_area = min(area1, area2)
     elif mode == "large":
-        ref = max(p1.area, p2.area)
+        ref_area = max(area1, area2)
     else:
         raise ValueError(
             f"Invalid mode {mode}, must be one of ['union', 'small', 'large']."
         )
-    return inter / ref if ref > 0 else 0.0
+    if ref_area == 0:
+        return 0.0
+    return inter_area / ref_area
 
 
-def quad_area(quad):
-    """Compute area of a quad polygon using Shoelace formula.
-    Corresponds to calculate_bbox_area(bbox).
-    Args:
-        quad: ndarray of shape [8], i.e. [x1,y1,x2,y2,x3,y3,x4,y4]
-    Returns:
-        float: area
-    """
-    pts = quad.reshape(4, 2)
-    n = len(pts)
-    area = 0.0
-    for i in range(n):
-        j = (i + 1) % n
-        area += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1]
-    return abs(area) / 2.0
+def nms_quad(boxes, quads, iou_same=0.6, iou_diff=0.95):
+    """``nms`` on the IoU of quads [N, 8]; ``boxes`` supplies classes and scores."""
+    geometry = _quad_geometry(quads)
+    areas = geometry[1]
+    indices = np.argsort(boxes[:, 1])[::-1].tolist()
+    selected_boxes = []
 
-
-def quad_is_contained(quad1, quad2):
-    """Check if quad1 is contained within quad2.
-    Corresponds to is_contained(box1, box2): intersect_area / box1_area >= 0.9
-    Args:
-        quad1, quad2: ndarray of shape [8]
-    Returns:
-        bool
-    """
-    from shapely.geometry import Polygon as ShapelyPolygon
-
-    p1 = ShapelyPolygon(quad1.reshape(4, 2))
-    p2 = ShapelyPolygon(quad2.reshape(4, 2))
-    if not p1.is_valid:
-        p1 = p1.buffer(0)
-    if not p2.is_valid:
-        p2 = p2.buffer(0)
-    if p1.area <= 0:
-        return False
-    return p1.intersection(p2).area / p1.area >= 0.9
-
-
-def _prepare_quad_geoms(quads):
-    """Precompute shapely polygons, areas and axis-aligned bounding boxes once.
-
-    Building shapely polygons is expensive, so we do it a single time per box
-    instead of rebuilding two polygons for every O(N^2) pair. The returned AABBs
-    enable a cheap disjointness pre-filter: if two AABBs do not overlap, the
-    polygons cannot intersect, so their IoU / overlap is exactly 0 and the
-    shapely intersection can be skipped entirely (numerically identical result).
-
-    Args:
-        quads: ndarray [N, 8], each row [x1,y1,x2,y2,x3,y3,x4,y4].
-    Returns:
-        (polys, areas[N], aabb[N, 4]) where aabb rows are [xmin,ymin,xmax,ymax].
-        Polygon validity is repaired with buffer(0), matching quad_iou/
-        quad_overlap_ratio/quad_is_contained; areas are taken from the repaired
-        polygon so ratios match the original implementations exactly.
-    """
-    from shapely.geometry import Polygon as ShapelyPolygon
-
-    n = len(quads)
-    polys = [None] * n
-    areas = np.zeros(n, dtype=np.float64)
-    aabb = np.zeros((n, 4), dtype=np.float64)
-    for k in range(n):
-        pts = np.asarray(quads[k], dtype=np.float64).reshape(4, 2)
-        p = ShapelyPolygon(pts)
-        if not p.is_valid:
-            p = p.buffer(0)
-        polys[k] = p
-        areas[k] = p.area
-        aabb[k, 0] = pts[:, 0].min()
-        aabb[k, 1] = pts[:, 1].min()
-        aabb[k, 2] = pts[:, 0].max()
-        aabb[k, 3] = pts[:, 1].max()
-    return polys, areas, aabb
-
-
-def _aabb_disjoint(a, b):
-    """True if two AABBs [xmin,ymin,xmax,ymax] do not overlap (touch counts as
-    disjoint since a shared edge has zero intersection area)."""
-    return a[2] <= b[0] or b[2] <= a[0] or a[3] <= b[1] or b[3] <= a[1]
-
-
-def nms_quad(boxes, quad, iou_same=0.6, iou_diff=0.95):
-    """NMS using quad polygon IoU.
-    Corresponds to nms(boxes, iou_same, iou_diff) with identical logic:
-    1. Sort by score descending
-    2. Greedy selection with per-pair IoU check
-    3. Same-class threshold iou_same, cross-class threshold iou_diff
-    Args:
-        boxes: ndarray [N, 6+], columns [class, score, ...]
-        quad: ndarray [N, 8]
-    Returns:
-        list of selected indices
-    """
-    quad = np.asarray(quad)
-    n = len(quad)
-    polys, areas, aabb = _prepare_quad_geoms(quad.reshape(n, 8))
-
-    scores = boxes[:, 1]
-    indices = np.argsort(scores)[::-1].tolist()
-    selected = []
-
-    while indices:
+    while len(indices) > 0:
         current = indices.pop(0)
-        selected.append(current)
-        remaining = []
-        current_class = boxes[current, 0]
-        cp = polys[current]
-        ca = areas[current]
-        cbox = aabb[current]
+        selected_boxes.append(current)
+        filtered_indices = []
         for i in indices:
-            threshold = iou_same if current_class == boxes[i, 0] else iou_diff
-            if _aabb_disjoint(cbox, aabb[i]):
-                # Disjoint AABBs => IoU 0 < threshold => box is kept.
-                remaining.append(i)
-                continue
-            inter = cp.intersection(polys[i]).area
-            union_area = ca + areas[i] - inter
-            iou_val = inter / union_area if union_area > 0 else 0.0
-            if iou_val < threshold:
-                remaining.append(i)
-        indices = remaining
-    return selected
+            inter_area = _quad_intersection(geometry, current, i)
+            union_area = areas[current] + areas[i] - inter_area
+            iou_value = inter_area / union_area if union_area > 0 else 0.0
+            threshold = iou_same if boxes[current, 0] == boxes[i, 0] else iou_diff
+            # If the IoU is below the threshold, keep the box
+            if iou_value < threshold:
+                filtered_indices.append(i)
+        indices = filtered_indices
+    return selected_boxes
 
 
 def check_containment_quad(
-    quad, class_ids, formula_index=None, category_index=None, mode=None
+    quads, class_ids, formula_index=None, category_index=None, mode=None
 ):
-    """Check containment relationships among quad polygons.
-    Corresponds to check_containment(boxes, formula_index, category_index, mode)
-    with identical logic, using quad_is_contained instead of is_contained.
-    Args:
-        quad: ndarray [N, 8]
-        class_ids: ndarray [N], class label for each box
-        formula_index, category_index, mode: same as check_containment
-    Returns:
-        (contains_other, contained_by_other): ndarray [N] each
-    """
-    n = len(quad)
-    quad = np.asarray(quad)
-    polys, areas, aabb = _prepare_quad_geoms(quad.reshape(n, 8))
+    """``check_containment`` on quads [N, 8], with the classes in ``class_ids``."""
+    geometry = _quad_geometry(quads)
+    areas = geometry[1]
+    n = len(areas)
     contains_other = np.zeros(n, dtype=int)
     contained_by_other = np.zeros(n, dtype=int)
-
-    def _contained(i, j):
-        # quad[i] contained in quad[j]: inter_area / area_i >= 0.9
-        if areas[i] <= 0:
-            return False
-        if _aabb_disjoint(aabb[i], aabb[j]):
-            return False
-        inter = polys[i].intersection(polys[j]).area
-        return inter / areas[i] >= 0.9
 
     for i in range(n):
         for j in range(n):
@@ -817,19 +734,25 @@ def check_containment_quad(
                 if class_ids[i] == formula_index and class_ids[j] != formula_index:
                     continue
             if category_index is not None and mode is not None:
-                if mode == "large" and class_ids[j] == category_index:
-                    if _contained(i, j):
-                        contained_by_other[i] = 1
-                        contains_other[j] = 1
-                if mode == "small" and class_ids[i] == category_index:
-                    if _contained(i, j):
-                        contained_by_other[i] = 1
-                        contains_other[j] = 1
-            else:
-                if _contained(i, j):
-                    contained_by_other[i] = 1
-                    contains_other[j] = 1
+                if not (
+                    (mode == "large" and class_ids[j] == category_index)
+                    or (mode == "small" and class_ids[i] == category_index)
+                ):
+                    continue
+            # quads[i] is contained in quads[j] when it covers >= 90% of its area
+            if areas[i] > 0 and _quad_intersection(geometry, i, j) / areas[i] >= 0.9:
+                contained_by_other[i] = 1
+                contains_other[j] = 1
     return contains_other, contained_by_other
+
+
+@function_requires_deps("shapely")
+def _clipped_quad_areas(quads, img_size):
+    """Areas of quads [N, 8] inside the page of size (width, height)."""
+    width, height = img_size
+    page = Polygon([(0, 0), (width, 0), (width, height), (0, height)])
+    polygons = _quad_geometry(quads)[0]
+    return np.array([p.intersection(page).area for p in polygons], dtype=np.float64)
 
 
 def filter_boxes(
@@ -846,30 +769,11 @@ def filter_boxes(
     """
     boxes = [box for box in src_boxes if box["label"] != "reference"]
     dropped_indexes = set()
-
-    # Precompute quad polygons/areas/AABBs once (instead of rebuilding two
-    # shapely polygons per O(N^2) pair). Entries are None for boxes without quad.
-    n_boxes = len(boxes)
-    _qpoly = [None] * n_boxes
-    _qarea = [0.0] * n_boxes
-    _qaabb = [None] * n_boxes
-    if any("quad" in box for box in boxes):
-        from shapely.geometry import Polygon as ShapelyPolygon
-
-        for k in range(n_boxes):
-            if "quad" in boxes[k]:
-                pts = np.array(boxes[k]["quad"], dtype=np.float64).reshape(4, 2)
-                p = ShapelyPolygon(pts)
-                if not p.is_valid:
-                    p = p.buffer(0)
-                _qpoly[k] = p
-                _qarea[k] = p.area
-                _qaabb[k] = (
-                    pts[:, 0].min(),
-                    pts[:, 1].min(),
-                    pts[:, 0].max(),
-                    pts[:, 1].max(),
-                )
+    # Compare the predicted quads of 4-point models rather than their AABBs,
+    # which overlap heavily on rotated or skewed pages.
+    quad_geometry = None
+    if boxes and all("quad" in box for box in boxes):
+        quad_geometry = _quad_geometry([box["quad"] for box in boxes])
 
     for i in range(len(boxes)):
         x1, y1, x2, y2 = boxes[i]["coordinate"]
@@ -879,15 +783,13 @@ def filter_boxes(
         for j in range(i + 1, len(boxes)):
             if i in dropped_indexes or j in dropped_indexes:
                 continue
-            # Use quad overlap if both boxes have quad
-            if "quad" in boxes[i] and "quad" in boxes[j]:
-                # AABB pre-filter: disjoint AABBs => overlap ratio is exactly 0.
-                if _aabb_disjoint(_qaabb[i], _qaabb[j]):
-                    overlap_ratio = 0.0
-                else:
-                    inter = _qpoly[i].intersection(_qpoly[j]).area
-                    ref = min(_qarea[i], _qarea[j])
-                    overlap_ratio = inter / ref if ref > 0 else 0.0
+            if quad_geometry is not None:
+                small_area = min(quad_geometry[1][i], quad_geometry[1][j])
+                overlap_ratio = (
+                    _quad_intersection(quad_geometry, i, j) / small_area
+                    if small_area > 0
+                    else 0.0
+                )
             else:
                 overlap_ratio = calculate_overlap_ratio(
                     boxes[i]["coordinate"], boxes[j]["coordinate"], "small"
@@ -909,14 +811,10 @@ def filter_boxes(
                     )
                     if poly_overlap_ratio < 0.7:
                         continue
-                # Use quad area if available
-                if "quad" in boxes[i]:
-                    box_area_i = quad_area(np.array(boxes[i]["quad"]).flatten())
+                if quad_geometry is not None:
+                    box_area_i, box_area_j = quad_geometry[1][[i, j]]
                 else:
                     box_area_i = calculate_bbox_area(boxes[i]["coordinate"])
-                if "quad" in boxes[j]:
-                    box_area_j = quad_area(np.array(boxes[j]["quad"]).flatten())
-                else:
                     box_area_j = calculate_bbox_area(boxes[j]["coordinate"])
                 labels = {boxes[i]["label"], boxes[j]["label"]}
                 if labels & {"image", "table", "seal", "chart"} and len(labels) > 1:
@@ -1007,298 +905,173 @@ class LayoutAnalysisProcess:
         layout_merge_bboxes_mode: Optional[Union[str, dict]],
         masks: Optional[ndarray] = None,
         layout_shape_mode: Optional[str] = "auto",
+        polygon_points: Optional[List[ndarray]] = None,
         quad: Optional[ndarray] = None,
+        qi: Optional[ndarray] = None,
         rel_logits: Optional[ndarray] = None,
         roor_logits: Optional[ndarray] = None,
-        qi: Optional[ndarray] = None,
+        filter_overlap_boxes: bool = False,
     ) -> Boxes:
         """Apply post-processing to the detection boxes.
 
         Args:
             boxes (ndarray): The input detection boxes with scores.
             img_size (tuple): The original image size.
-            quad (ndarray, optional): Quad coordinates [N, 8] for 4-point box models.
+            quad (ndarray, optional): Corners [N, 8] predicted by 4-point models
+                (PP-DocLayoutV4), in original-image coordinates.
+            qi (ndarray, optional): The query index [N] of each box, for models
+                whose reading order is decoded here from the pairwise
+                ``rel_logits`` and ``roor_logits`` [Q, Q].
+            filter_overlap_boxes (bool, optional): Whether to remove overlapping
+                boxes with ``filter_boxes``, before ``layout_unclip_ratio``
+                expands them. Defaults to False.
 
         Returns:
             Boxes: The post-processed detection boxes.
         """
         if layout_shape_mode == "rect":
             masks = None
+            polygon_points = None
             quad = None
-        has_order_logits = (
-            rel_logits is not None and roor_logits is not None and qi is not None
-        )
+        for name, values in (
+            ("masks", masks),
+            ("polygon_points", polygon_points),
+            ("quad", quad),
+            ("qi", qi),
+        ):
+            if values is not None and len(values) != len(boxes):
+                raise ValueError(
+                    f"Expected one entry of `{name}` per box ({len(boxes)}), "
+                    f"got {len(values)}."
+                )
         boxes[:, 2:6] = np.round(boxes[:, 2:6]).astype(int)
+        # Indices of the remaining boxes into the model output. Masks, polygons
+        # and quads are gathered with it once the boxes are final.
+        keep = np.arange(len(boxes))
         if isinstance(threshold, float):
-            expect_boxes = (boxes[:, 1] > threshold) & (boxes[:, 0] > -1)
-            boxes = boxes[expect_boxes, :]
-            if masks is not None:
-                masks = masks[expect_boxes, ...]
-            if quad is not None:
-                quad = quad[expect_boxes]
-            if has_order_logits:
-                qi = qi[expect_boxes]
+            keep = np.flatnonzero((boxes[:, 1] > threshold) & (boxes[:, 0] > -1))
         elif isinstance(threshold, dict):
-            category_filtered_boxes = []
-            if masks is not None:
-                category_filtered_masks = []
-            if quad is not None:
-                category_filtered_quad = []
-            if has_order_logits:
-                category_filtered_qi = []
-            for cat_id in np.unique(boxes[:, 0]):
-                cat_mask = boxes[:, 0] == cat_id
-                category_boxes = boxes[cat_mask]
-                if masks is not None:
-                    category_masks = masks[cat_mask]
-                if quad is not None:
-                    category_quad = quad[cat_mask]
-                if has_order_logits:
-                    category_qi = qi[cat_mask]
-                category_threshold = threshold.get(int(cat_id), 0.5)
-                selected_indices = (category_boxes[:, 1] > category_threshold) & (
-                    category_boxes[:, 0] > -1
+            keep = [
+                np.flatnonzero(
+                    (boxes[:, 0] == cat_id)
+                    & (boxes[:, 1] > threshold.get(int(cat_id), 0.5))
                 )
-                if masks is not None:
-                    category_masks = category_masks[selected_indices]
-                    category_filtered_masks.append(category_masks)
-                if quad is not None:
-                    category_filtered_quad.append(category_quad[selected_indices])
-                if has_order_logits:
-                    category_filtered_qi.append(category_qi[selected_indices])
-                category_filtered_boxes.append(category_boxes[selected_indices])
-            boxes = (
-                np.vstack(category_filtered_boxes)
-                if category_filtered_boxes
-                else np.array([])
-            )
-            if masks is not None:
-                masks = (
-                    np.concatenate(category_filtered_masks)
-                    if category_filtered_masks
-                    else np.array([])
-                )
-            if quad is not None:
-                quad = (
-                    np.vstack(category_filtered_quad)
-                    if category_filtered_quad
-                    else np.array([]).reshape(0, 8)
-                )
-            if has_order_logits:
-                qi = (
-                    np.concatenate(category_filtered_qi)
-                    if category_filtered_qi
-                    else np.array([], dtype=np.int64)
-                )
+                for cat_id in np.unique(boxes[:, 0])
+                if cat_id > -1
+            ]
+            keep = np.concatenate(keep) if keep else np.array([], dtype=np.int64)
+        boxes = boxes[keep]
 
-        # Compute reading order right after threshold filtering
-        if has_order_logits and len(boxes) > 0:
-            order = compute_reading_order(boxes, rel_logits, roor_logits, qi)
-            boxes = np.concatenate(
-                [boxes, order.reshape(-1, 1).astype(np.float32)], axis=1
-            )
+        if qi is not None:
+            order = compute_reading_order(qi[keep], rel_logits, roor_logits)
+            boxes = np.column_stack([boxes, order.astype(boxes.dtype)])
 
         if layout_nms:
             if quad is not None:
-                selected_indices = nms_quad(boxes, quad, iou_same=0.6, iou_diff=0.98)
+                selected = nms_quad(boxes, quad[keep], iou_same=0.6, iou_diff=0.98)
             else:
-                selected_indices = nms(boxes[:, :6], iou_same=0.6, iou_diff=0.98)
-            boxes = np.array(boxes[selected_indices])
-            if masks is not None:
-                masks = [masks[i] for i in selected_indices]
-            if quad is not None:
-                quad = quad[selected_indices]
+                selected = nms(boxes[:, :6], iou_same=0.6, iou_diff=0.98)
+            boxes, keep = boxes[selected], keep[selected]
 
-        filter_large_image = True
-        # boxes.shape[1] == 6 is object detection, 7 is new ordered object detection, 8 is ordered object detection
-        if filter_large_image and len(boxes) > 1 and boxes.shape[1] in [6, 7, 8]:
-            if img_size[0] > img_size[1]:
-                area_thres = 0.82
-            else:
-                area_thres = 0.93
-            image_index = self.labels.index("image") if "image" in self.labels else None
-            img_area = img_size[0] * img_size[1]
-            filtered_boxes = []
-            filtered_masks = []
-            filtered_quad = []
-            for idx, box in enumerate(boxes):
-                (
-                    label_index,
-                    score,
-                    xmin,
-                    ymin,
-                    xmax,
-                    ymax,
-                ) = box[:6]
-                if label_index == image_index:
-                    xmin = max(0, xmin)
-                    ymin = max(0, ymin)
-                    xmax = min(img_size[0], xmax)
-                    ymax = min(img_size[1], ymax)
-                    if quad is not None:
-                        box_area = quad_area(quad[idx])
-                    else:
-                        box_area = (xmax - xmin) * (ymax - ymin)
-                    if box_area <= area_thres * img_area:
-                        filtered_boxes.append(box)
-                        if masks is not None:
-                            filtered_masks.append(masks[idx])
-                        if quad is not None:
-                            filtered_quad.append(quad[idx])
-                else:
-                    filtered_boxes.append(box)
-                    if masks is not None:
-                        filtered_masks.append(masks[idx])
-                    if quad is not None:
-                        filtered_quad.append(quad[idx])
-            if len(filtered_boxes) == 0:
-                filtered_boxes = boxes
-                if masks is not None:
-                    filtered_masks = masks
-                if quad is not None:
-                    filtered_quad = list(quad)
-            boxes = np.array(filtered_boxes)
-            if masks is not None:
-                masks = filtered_masks
+        # Drop "image" boxes that cover nearly the whole page, unless that would
+        # drop every box.
+        if len(boxes) > 1 and "image" in self.labels:
+            img_w, img_h = img_size
+            area_thres = 0.82 if img_w > img_h else 0.93
+            is_image = boxes[:, 0] == self.labels.index("image")
             if quad is not None:
-                quad = np.array(filtered_quad)
+                areas = _clipped_quad_areas(quad[keep[is_image]], img_size)
+            else:
+                coords = np.clip(boxes[is_image, 2:6], 0, [img_w, img_h] * 2)
+                areas = (coords[:, 2] - coords[:, 0]) * (coords[:, 3] - coords[:, 1])
+            is_large = np.zeros(len(boxes), dtype=bool)
+            is_large[is_image] = areas > area_thres * img_w * img_h
+            if not is_large.all():
+                boxes, keep = boxes[~is_large], keep[~is_large]
 
         if layout_merge_bboxes_mode:
             formula_index = (
                 self.labels.index("formula") if "formula" in self.labels else None
             )
+            # A single mode applies to every category.
             if isinstance(layout_merge_bboxes_mode, str):
-                assert layout_merge_bboxes_mode in [
+                merge_modes = {None: layout_merge_bboxes_mode}
+            elif isinstance(layout_merge_bboxes_mode, dict):
+                merge_modes = layout_merge_bboxes_mode
+            else:
+                merge_modes = {}
+            keep_mask = np.ones(len(boxes), dtype=bool)
+            for category_index, layout_mode in merge_modes.items():
+                assert layout_mode in [
                     "union",
                     "large",
                     "small",
-                ], f"The value of `layout_merge_bboxes_mode` must be one of ['union', 'large', 'small'], but got {layout_merge_bboxes_mode}"
-
-                if layout_merge_bboxes_mode == "union":
-                    pass
-                else:
-                    if quad is not None:
-                        contains_other, contained_by_other = check_containment_quad(
-                            quad, boxes[:, 0], formula_index
-                        )
-                    else:
-                        contains_other, contained_by_other = check_containment(
-                            boxes[:, :6], formula_index
-                        )
-                    if layout_merge_bboxes_mode == "large":
-                        keep_mask = contained_by_other == 0
-                        boxes = boxes[keep_mask]
-                        if masks is not None:
-                            masks = [
-                                mask for i, mask in enumerate(masks) if keep_mask[i]
-                            ]
-                        if quad is not None:
-                            quad = quad[keep_mask]
-                    elif layout_merge_bboxes_mode == "small":
-                        keep_mask = (contains_other == 0) | (contained_by_other == 1)
-                        boxes = boxes[keep_mask]
-                        if masks is not None:
-                            masks = [
-                                mask for i, mask in enumerate(masks) if keep_mask[i]
-                            ]
-                        if quad is not None:
-                            quad = quad[keep_mask]
-            elif isinstance(layout_merge_bboxes_mode, dict):
-                keep_mask = np.ones(len(boxes), dtype=bool)
-                for category_index, layout_mode in layout_merge_bboxes_mode.items():
-                    assert layout_mode in [
-                        "union",
-                        "large",
-                        "small",
-                    ], f"The value of `layout_merge_bboxes_mode` must be one of ['union', 'large', 'small'], but got {layout_mode}"
-                    if layout_mode == "union":
-                        pass
-                    else:
-                        if layout_mode == "large":
-                            if quad is not None:
-                                contains_other, contained_by_other = (
-                                    check_containment_quad(
-                                        quad,
-                                        boxes[:, 0],
-                                        formula_index,
-                                        category_index,
-                                        mode=layout_mode,
-                                    )
-                                )
-                            else:
-                                contains_other, contained_by_other = check_containment(
-                                    boxes[:, :6],
-                                    formula_index,
-                                    category_index,
-                                    mode=layout_mode,
-                                )
-                            # Remove boxes that are contained by other boxes
-                            keep_mask &= contained_by_other == 0
-                        elif layout_mode == "small":
-                            if quad is not None:
-                                contains_other, contained_by_other = (
-                                    check_containment_quad(
-                                        quad,
-                                        boxes[:, 0],
-                                        formula_index,
-                                        category_index,
-                                        mode=layout_mode,
-                                    )
-                                )
-                            else:
-                                contains_other, contained_by_other = check_containment(
-                                    boxes[:, :6],
-                                    formula_index,
-                                    category_index,
-                                    mode=layout_mode,
-                                )
-                            # Keep boxes that do not contain others or are contained by others
-                            keep_mask &= (contains_other == 0) | (
-                                contained_by_other == 1
-                            )
-                boxes = boxes[keep_mask]
-                if masks is not None:
-                    masks = [mask for i, mask in enumerate(masks) if keep_mask[i]]
+                ], f"The value of `layout_merge_bboxes_mode` must be one of ['union', 'large', 'small'], but got {layout_mode}"
+                if layout_mode == "union":
+                    continue
                 if quad is not None:
-                    quad = quad[keep_mask]
+                    contains_other, contained_by_other = check_containment_quad(
+                        quad[keep],
+                        boxes[:, 0],
+                        formula_index,
+                        category_index,
+                        mode=layout_mode,
+                    )
+                else:
+                    contains_other, contained_by_other = check_containment(
+                        boxes[:, :6], formula_index, category_index, mode=layout_mode
+                    )
+                if layout_mode == "large":
+                    # Remove boxes that are contained by other boxes
+                    keep_mask &= contained_by_other == 0
+                else:
+                    # Keep boxes that do not contain others or are contained by others
+                    keep_mask &= (contains_other == 0) | (contained_by_other == 1)
+            boxes, keep = boxes[keep_mask], keep[keep_mask]
 
         if boxes.size == 0:
-            return np.array([])
+            # ``filter_boxes`` returns a list.
+            return [] if filter_overlap_boxes else np.array([])
 
-        if boxes.shape[1] == 8:
+        if boxes.shape[1] in (7, 8):
             # Sort boxes by their order
-            sorted_idx = np.lexsort((-boxes[:, 7], boxes[:, 6]))
-            sorted_boxes = boxes[sorted_idx]
-            boxes = sorted_boxes[:, :6]
-            if masks is not None:
-                sorted_masks = [masks[i] for i in sorted_idx]
-                masks = sorted_masks
-            if quad is not None:
-                quad = quad[sorted_idx]
+            if boxes.shape[1] == 8:
+                sorted_idx = np.lexsort((-boxes[:, 7], boxes[:, 6]))
+            else:
+                # Stable, so that one query under several labels keeps the
+                # score order.
+                sorted_idx = np.argsort(boxes[:, 6], kind="stable")
+            boxes, keep = boxes[sorted_idx, :6], keep[sorted_idx]
 
-        if boxes.shape[1] == 7:
-            # Sort boxes by their order
-            sorted_idx = np.argsort(boxes[:, 6])
-            sorted_boxes = boxes[sorted_idx]
-            boxes = sorted_boxes[:, :6]
-            if masks is not None:
-                sorted_masks = [masks[i] for i in sorted_idx]
-                masks = sorted_masks
-            if quad is not None:
-                quad = quad[sorted_idx]
-
-        polygon_points = None
-        if masks is not None:
+        if polygon_points is None and masks is not None:
             scale_ratio = [h / s for h, s in zip(self.scale_size, img_size)]
             polygon_points = extract_polygon_points_by_masks(
-                boxes, np.array(masks), scale_ratio, layout_shape_mode, quad=quad
+                boxes, np.asarray(masks)[keep], scale_ratio, layout_shape_mode
             )
-        # elif quad is not None:
-        #     # No masks and no polygon_points, but we have model-predicted quads
-        #     polygon_points = [quad[i].reshape(4, 2) for i in range(len(quad))]
-        #     polygon_points = normalize_polygon_points_by_boxes(
-        #         boxes, polygon_points, layout_shape_mode, quad=quad
-        #     )
+        elif polygon_points is not None:
+            polygon_points = normalize_polygon_points_by_boxes(
+                boxes, [polygon_points[i] for i in keep], layout_shape_mode
+            )
+        if quad is not None:
+            quad = quad[keep]
+
+        if filter_overlap_boxes:
+            # Compare the predicted geometry: the expanded boxes can overlap
+            # where the predicted ones do not.
+            candidates = restructured_boxes(
+                boxes, self.labels, img_size, polygon_points, quad=quad
+            )
+            # ``restructured_boxes`` numbers each box by its row.
+            rows = [
+                box["order"] - 1 for box in filter_boxes(candidates, layout_shape_mode)
+            ]
+            if not rows:
+                return []
+            boxes = boxes[rows]
+            if polygon_points is not None:
+                polygon_points = [polygon_points[i] for i in rows]
+            if quad is not None:
+                quad = quad[rows]
 
         if layout_unclip_ratio:
             if isinstance(layout_unclip_ratio, float):
@@ -1311,7 +1084,13 @@ class LayoutAnalysisProcess:
                 pass
             else:
                 raise ValueError(
-                    f"The type of `layout_unclip_ratio` must be float, Tuple[float, float] or  Dict[int, Tuple[float, float]], but got {type(layout_unclip_ratio)}."
+                    f"The type of `layout_unclip_ratio` must be float, Tuple[float, float] or Dict[int, Tuple[float, float]], but got {type(layout_unclip_ratio)}."
+                )
+            if quad is not None:
+                quad = _unclip_quads(quad, boxes, layout_unclip_ratio)
+            if polygon_points is not None:
+                polygon_points = _unclip_polygons(
+                    polygon_points, boxes, layout_unclip_ratio
                 )
             boxes = unclip_boxes(boxes, layout_unclip_ratio)
 
@@ -1323,7 +1102,7 @@ class LayoutAnalysisProcess:
         else:
             """Unexpected Input Box Shape"""
             raise ValueError(
-                f"The shape of boxes should be 6 or 10, instead of {boxes.shape[1]}"
+                f"The shape of boxes should be 6, 7 or 8, instead of {boxes.shape[1]}"
             )
         return boxes
 
@@ -1351,15 +1130,24 @@ class LayoutAnalysisProcess:
         outputs = []
         for idx, (data, output) in enumerate(zip(datas, batch_outputs)):
             current_layout_shape_mode = layout_shape_mode
-            masks = output.get("masks", None)
-            quad = output.get("quad", None)
-            if masks is None and quad is None:
+            if "masks" in output:
+                masks = output["masks"]
+                polygon_points = None
+            elif "polygon_points" in output:
+                masks = None
+                polygon_points = output["polygon_points"]
+            elif "quad" in output:
+                # 4-point models (PP-DocLayoutV4) predict the quads directly.
+                masks = None
+                polygon_points = None
+            else:
                 current_layout_shape_mode = "rect"
                 if idx == 0 and layout_shape_mode not in ["rect", "auto"]:
                     logging.warning(
                         f"The model you are using does not support polygon output, but the layout_shape_mode is specified as {layout_shape_mode}, which will be set to 'rect'"
                     )
-
+                masks = None
+                polygon_points = None
             boxes = self.apply(
                 output["boxes"],
                 data["ori_img_size"],
@@ -1369,13 +1157,13 @@ class LayoutAnalysisProcess:
                 layout_merge_bboxes_mode,
                 masks,
                 current_layout_shape_mode,
-                quad=quad,
-                rel_logits=output.get("rel_logits", None),
-                roor_logits=output.get("roor_logits", None),
-                qi=output.get("qi", None),
+                polygon_points=polygon_points,
+                quad=output.get("quad"),
+                qi=output.get("qi"),
+                rel_logits=output.get("rel_logits"),
+                roor_logits=output.get("roor_logits"),
+                filter_overlap_boxes=bool(filter_overlap_boxes),
             )
-            if filter_overlap_boxes:
-                boxes = filter_boxes(boxes, current_layout_shape_mode)
             skip_order_labels = (
                 skip_order_labels
                 if skip_order_labels is not None
